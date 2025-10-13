@@ -1,0 +1,19 @@
+# Entorno virtual
+venv/
+__pycache__/
+*.pyc
+
+# Archivos de configuración sensibles
+.env
+alias.env
+firmado.txt
+notas.txt
+
+# Compilaciones
+target/
+*.lock
+*.log
+
+# Archivos temporales
+*.tmp
+*.bak

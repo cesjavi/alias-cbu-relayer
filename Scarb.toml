@@ -1,0 +1,15 @@
+[package]
+name = "alias_cbu"
+version = "0.1.0"
+edition = "2023_10"
+cairo-version = "2.6.0"
+
+[dependencies]
+starknet = "2.6.0"
+
+[lib]
+# Dejá que Scarb use src/lib.cairo como entrypoint (convención).
+
+# Marcá que este paquete produce un contrato Starknet
+[[target.starknet-contract]]
+# opcional: si tuvieras varios, podés enumerarlos
