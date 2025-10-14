@@ -515,20 +515,17 @@ async def resolve_alias(alias: str):
     try:
         from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
-        try:
-            from starknet_py.net.client_models import BlockId, Tag
-            block_id_pending = BlockId(tag=Tag.PENDING)
-        except Exception:
-            block_id_pending = "pending"
 
+        # 👇 starknet-py 0.28.0 usa block_number="latest" (NO block_id)
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("addr_of_alias"),
-                calldata=[k]
+                calldata=[k],
             ),
-            block_id=block_id_pending
+            block_number="latest"
         )
+
         onchain_addr = hex(res[0])
     except Exception as e:
         raise HTTPException(500, f"Error on-chain: {e}")
@@ -538,7 +535,7 @@ async def resolve_alias(alias: str):
         "alias": alias_norm,
         "alias_key": hex(k),
         "onchain_address": onchain_addr,
-        "memory_index": {"address": mem[0], "alias": mem[1]} if mem else None
+        "memory_index": {"address": mem[0], "alias": mem[1]} if mem else None,
     }
 
 
@@ -551,17 +548,19 @@ async def resolve_address(address: str):
 
     client, _ = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call, Tag, BlockId
+        from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
 
+        # 👇 igual: block_number="latest"
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_key_of_addr"),
-                calldata=[addr_int]
+                calldata=[addr_int],
             ),
-            block_id=BlockId(tag=Tag.PENDING)   # <- evita Invalid block id
+            block_number="latest"
         )
+
         onchain_key = hex(res[0])
     except Exception as e:
         raise HTTPException(500, f"Error on-chain: {e}")
@@ -570,7 +569,7 @@ async def resolve_address(address: str):
     return {
         "address": hex(addr_int),
         "onchain_alias_key": onchain_key,
-        "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None
+        "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None,
     }
 
 @app.get("/list")
