@@ -1,13 +1,11 @@
 {
   "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" },
-    { "src": "templates/**", "use": "@vercel/static" }
+    { "src": "app.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "app.py" },
     { "src": "/aliascbu\\.js", "dest": "/public/aliascbu.js" },
-    { "src": "/(.*\\.(?:js|css|png|jpg|svg|ico))", "dest": "templates/$1" },
-    { "src": "^/$", "dest": "templates/index.html" }
+    { "src": "/api/(.*)", "dest": "app.py" },
+    { "src": "/(.*)", "dest": "app.py" }
   ]
 }
