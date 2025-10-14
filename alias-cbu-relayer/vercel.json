@@ -1,9 +1,11 @@
 {
   "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" }
+    { "src": "app.py", "use": "@vercel/python" },
+    { "src": "public/**", "use": "@vercel/static" }
   ],
   "routes": [
+    { "src": "/aliascbu\\.js", "dest": "public/aliascbu.js" },
     { "src": "/(.*)", "dest": "app.py" }
   ]
 }
