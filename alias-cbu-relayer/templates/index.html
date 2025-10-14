@@ -366,7 +366,7 @@
 
     $("btn-list").onclick = async () => {
       try {
-        const r = await getJSON(apiUrl("/list"));
+        const r = await getJSON(apiUrl("/api/list"));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
