@@ -242,11 +242,12 @@ async def submit(data: SubmitIn):
         raise HTTPException(400, "Firma inválida (hex)")
 
     # --- Enviar multicall ---
-    # Hacemos lazy import aquí, y construimos cliente/relayer recién ahora
+    # Lazy import + construcción de cliente/relayer recién ahora
     client, relayer = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import Call, Tag, BlockId
         from starknet_py.hash.selector import get_selector_from_name
+        from starknet_py.net.client_errors import ClientError
     except Exception as e:
         raise HTTPException(500, f"starknet_py no disponible: {e}")
 
@@ -261,9 +262,33 @@ async def submit(data: SubmitIn):
         calldata=[k, ln, user]   # <— pasa el 'who'
     )
 
+    # ===== Estimar con 'pending' y fallback a fee fijo =====
+    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK (ajustá si hace falta)
     try:
-        resp = await relayer.execute_v3(calls=[erc20_transfer_from, alias_register], auto_estimate=True)
+        # algunos RPC fallan con 'latest'; usamos 'pending'
+        block_id = BlockId(tag=Tag.PENDING)
+
+        # método interno pero estable para v3; si no existe en tu versión, se captura en except
+        est = await relayer._estimate_fee(
+            calls=[erc20_transfer_from, alias_register],
+            block_id=block_id,
+            version=3,
+            nonce=None
+        )
+        max_fee = int(est.overall_fee * 13 // 10)  # +30% colchón
+    except Exception as e:
+        print("[warn] estimate failed, using SAFE_MAX_FEE fallback:", e)
+        max_fee = SAFE_MAX_FEE_FALLBACK
+
+    try:
+        resp = await relayer.execute_v3(
+            calls=[erc20_transfer_from, alias_register],
+            auto_estimate=False,
+            max_fee=max_fee
+        )
         tx_hash = resp.transaction_hash
+    except ClientError as ce:
+        raise HTTPException(500, f"Error enviando tx (client): {ce}")
     except Exception as e:
         raise HTTPException(500, f"Error enviando tx: {e}")
 
@@ -283,15 +308,16 @@ async def resolve_alias(alias: str):
 
     client, _ = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import Call, Tag, BlockId
         from starknet_py.hash.selector import get_selector_from_name
+
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("addr_of_alias"),
                 calldata=[k]
             ),
-            block_number="latest"
+            block_id=BlockId(tag=Tag.PENDING)   # <- evita Invalid block id
         )
         onchain_addr = hex(res[0])
     except Exception as e:
@@ -314,15 +340,16 @@ async def resolve_address(address: str):
 
     client, _ = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import Call, Tag, BlockId
         from starknet_py.hash.selector import get_selector_from_name
+
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_key_of_addr"),
                 calldata=[addr_int]
             ),
-            block_number="latest"
+            block_id=BlockId(tag=Tag.PENDING)   # <- evita Invalid block id
         )
         onchain_key = hex(res[0])
     except Exception as e:
