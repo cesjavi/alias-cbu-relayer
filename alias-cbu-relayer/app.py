@@ -241,6 +241,95 @@ async def submit(data: SubmitIn):
     except Exception:
         raise HTTPException(400, "Firma inválida (hex)")
 
+    client, relayer = _get_client_and_relayer()
+    try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
+            block_id_pending = BlockId(tag=Tag.PENDING)
+        except Exception:
+            # Compatibilidad con versiones viejas
+            block_id_pending = "pending"
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    erc20_transfer_from = Call(
+        to_addr=AIC_TOKEN,
+        selector=get_selector_from_name("transfer_from"),
+        calldata=[user, relayer.address, FEE_AIC_WEI, 0]
+    )
+    alias_register = Call(
+        to_addr=ALIAS_CONTRACT,
+        selector=get_selector_from_name("admin_register_for"),
+        calldata=[k, ln, user]
+    )
+
+    # ===== Estimar con 'pending' y fallback a fee fijo =====
+    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK (ajustá si hace falta)
+    try:
+        # versiones viejas pueden no tener _estimate_fee, por eso se captura
+        if hasattr(relayer, "_estimate_fee"):
+            est = await relayer._estimate_fee(
+                calls=[erc20_transfer_from, alias_register],
+                block_id=block_id_pending,
+                version=3,
+                nonce=None
+            )
+            max_fee = int(est.overall_fee * 13 // 10)
+        else:
+            raise Exception("_estimate_fee no disponible")
+    except Exception as e:
+        print("[warn] estimate failed, using SAFE_MAX_FEE fallback:", e)
+        max_fee = SAFE_MAX_FEE_FALLBACK
+
+    try:
+        resp = await relayer.execute_v3(
+            calls=[erc20_transfer_from, alias_register],
+            auto_estimate=False,
+            max_fee=max_fee
+        )
+        tx_hash = resp.transaction_hash
+    except Exception as e:
+        raise HTTPException(500, f"Error enviando tx: {e}")
+
+    alias_key_hex = hex(k)
+    addr_hex = hex(user)
+    ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
+    ADDR_INDEX[addr_hex] = (alias_key_hex, alias_norm)
+
+    return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
+
+    # Validaciones básicas
+    try:
+        alias_norm = normalize_alias(data.alias)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    k = alias_key(alias_norm)
+    ln = len(alias_norm)
+
+    try:
+        user = int(data.user_address, 16)
+    except ValueError:
+        raise HTTPException(400, "user_address inválido (hex)")
+
+    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
+        raise HTTPException(400, "Nonce invalido (prepare faltante)")
+
+    # Firma (passthrough)
+    if data.signature and len(data.signature) >= 2:
+        r_hex, s_hex = data.signature[0], data.signature[1]
+    else:
+        if not (data.signature_r and data.signature_s):
+            raise HTTPException(400, "Falta firma (signature o r/s)")
+        r_hex, s_hex = data.signature_r, data.signature_s
+
+    try:
+        int(r_hex, 16); int(s_hex, 16)
+    except Exception:
+        raise HTTPException(400, "Firma inválida (hex)")
+
     # --- Enviar multicall ---
     # Lazy import + construcción de cliente/relayer recién ahora
     client, relayer = _get_client_and_relayer()
@@ -308,8 +397,13 @@ async def resolve_alias(alias: str):
 
     client, _ = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call, Tag, BlockId
+        from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
+            block_id_pending = BlockId(tag=Tag.PENDING)
+        except Exception:
+            block_id_pending = "pending"
 
         res = await client.call_contract(
             call=Call(
@@ -317,7 +411,7 @@ async def resolve_alias(alias: str):
                 selector=get_selector_from_name("addr_of_alias"),
                 calldata=[k]
             ),
-            block_id=BlockId(tag=Tag.PENDING)   # <- evita Invalid block id
+            block_id=block_id_pending
         )
         onchain_addr = hex(res[0])
     except Exception as e:
@@ -330,6 +424,7 @@ async def resolve_alias(alias: str):
         "onchain_address": onchain_addr,
         "memory_index": {"address": mem[0], "alias": mem[1]} if mem else None
     }
+
 
 @app.get("/api/resolve_address")
 async def resolve_address(address: str):
