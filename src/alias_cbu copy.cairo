@@ -1,27 +1,20 @@
-// src/AliasCBU.cairo — Cairo 2.11+/2.12 compatible (sin #[view])
-
+// src/AliasCBU.cairo — Cairo 2.6.x compatible
 #[starknet::contract]
 mod alias_cbu {
-    // ===== Imports =====
-    use core::traits::TryInto;
+    // ==== imports básicos ====
+    use core::panic_with_felt252;
     use starknet::ContractAddress;
     use starknet::get_caller_address;
-    use starknet::storage::{
-        Map,
-        StorageMapReadAccess,
-        StorageMapWriteAccess,
-        StoragePointerReadAccess,
-        StoragePointerWriteAccess,
-    };
+    use starknet::storage::{Map, StoragePathEntry};
 
-    // ===== Constantes de política =====
+    // ==== constantes de política ====
     const MIN_LEN: u32 = 4;
     const MAX_LEN: u32 = 20;
 
-    // Sentinelas (0 = vacío)
+    // sentinelas (0 = vacío)
     const ZERO_FELT: felt252 = 0;
 
-    // ===== Interfaz pública (resolver) =====
+    // ==== interfaz (resolver) ====
     #[starknet::interface]
     pub trait IAliasResolver<TContractState> {
         fn addr_of_alias(self: @TContractState, alias_key: felt252) -> ContractAddress;
@@ -31,12 +24,11 @@ mod alias_cbu {
         fn get_fee_token(self: @TContractState) -> ContractAddress;
         fn get_fee_amount(self: @TContractState) -> u256;
         fn get_len_bounds(self: @TContractState) -> (u32, u32);
-        fn alias_key_of_addr(self: @TContractState, who: ContractAddress) -> felt252;
     }
 
-    // ===== Eventos =====
-    #[derive(Drop, starknet::Event)]
+    // ==== eventos ====
     #[event]
+    #[derive(Drop, starknet::Event)]
     pub enum Event {
         AliasRegistered: AliasRegistered,
         AliasUpdated: AliasUpdated,
@@ -75,7 +67,7 @@ mod alias_cbu {
         pub amount: u256,
     }
 
-    // ===== Storage =====
+    // ==== storage con Map (reemplaza LegacyMap) ====
     #[storage]
     struct Storage {
         // alias_key -> address (0 = libre)
@@ -89,11 +81,16 @@ mod alias_cbu {
         fee_amount: u256,
     }
 
-    // ===== Helpers ContractAddress <-> felt =====
-    fn addr_to_felt(addr: ContractAddress) -> felt252 { addr.into() }
-    fn felt_to_addr(x: felt252) -> ContractAddress { x.try_into().unwrap() }
+    // helper para convertir ContractAddress <-> felt
+    fn addr_to_felt(addr: ContractAddress) -> felt252 {
+        addr.into()
+    }
 
-    // ===== Constructor =====
+    fn felt_to_addr(x: felt252) -> ContractAddress {
+        x.try_into().unwrap()
+    }
+
+    // ==== constructor ====
     #[constructor]
     fn constructor(
         ref self: ContractState,
@@ -106,7 +103,7 @@ mod alias_cbu {
         self.fee_amount.write(fee_amount);
     }
 
-    // ===== Helpers internos =====
+    // ==== helpers internos ====
     fn assert_owner(self: @ContractState) {
         let caller = get_caller_address();
         assert(caller == self.owner.read(), 'ONLY_OWNER');
@@ -116,8 +113,7 @@ mod alias_cbu {
         assert(len >= MIN_LEN && len <= MAX_LEN, 'INVALID_LENGTH');
     }
 
-    // ===== Implementación de lecturas (views) =====
-    // En Cairo 2.11+ una función "view" es cualquier fn con `self: @ContractState`.
+    // ==== implementación del resolver ====
     #[abi(embed_v0)]
     impl Resolver of IAliasResolver<ContractState> {
         fn addr_of_alias(self: @ContractState, alias_key: felt252) -> ContractAddress {
@@ -125,7 +121,8 @@ mod alias_cbu {
         }
 
         fn alias_of_addr(self: @ContractState, who: ContractAddress) -> felt252 {
-            self.addr_to_alias.read(addr_to_felt(who))
+            let who_f: felt252 = addr_to_felt(who);
+            self.addr_to_alias.read(who_f)
         }
 
         fn is_available(self: @ContractState, alias_key: felt252) -> bool {
@@ -133,21 +130,27 @@ mod alias_cbu {
             addr_to_felt(a) == ZERO_FELT
         }
 
-        fn get_owner(self: @ContractState) -> ContractAddress { self.owner.read() }
-        fn get_fee_token(self: @ContractState) -> ContractAddress { self.fee_token.read() }
-        fn get_fee_amount(self: @ContractState) -> u256 { self.fee_amount.read() }
-        fn get_len_bounds(self: @ContractState) -> (u32, u32) { (MIN_LEN, MAX_LEN) }
+        fn get_owner(self: @ContractState) -> ContractAddress {
+            self.owner.read()
+        }
 
-        fn alias_key_of_addr(self: @ContractState, who: ContractAddress) -> felt252 {
-            self.addr_to_alias.read(addr_to_felt(who))
+        fn get_fee_token(self: @ContractState) -> ContractAddress {
+            self.fee_token.read()
+        }
+
+        fn get_fee_amount(self: @ContractState) -> u256 {
+            self.fee_amount.read()
+        }
+
+        fn get_len_bounds(self: @ContractState) -> (u32, u32) {
+            (MIN_LEN, MAX_LEN)
         }
     }
 
-    // ===== Mutaciones de usuario / admin =====
+    // ==== mutaciones de usuario ====
     #[generate_trait]
     #[abi(per_item)]
     impl ExternalImpl of ExternalTrait {
-        // Usuario: registra su alias si está libre
         #[external(v0)]
         fn register_my_alias(ref self: ContractState, alias_key: felt252, len: u32) {
             let caller = get_caller_address();
@@ -166,10 +169,9 @@ mod alias_cbu {
             self.alias_to_addr.write(alias_key, caller);
             self.addr_to_alias.write(caller_f, alias_key);
 
-            self.emit(Event::AliasRegistered(AliasRegistered { alias_key, who: caller }));
+            self.emit(AliasRegistered { alias_key, who: caller });
         }
 
-        // Usuario: actualiza su alias (libera el anterior si existía)
         #[external(v0)]
         fn update_my_alias(ref self: ContractState, new_alias_key: felt252, len: u32) {
             let caller = get_caller_address();
@@ -191,10 +193,9 @@ mod alias_cbu {
             self.alias_to_addr.write(new_alias_key, caller);
             self.addr_to_alias.write(caller_f, new_alias_key);
 
-            self.emit(Event::AliasUpdated(AliasUpdated { alias_key: new_alias_key, who: caller }));
+            self.emit(AliasUpdated { alias_key: new_alias_key, who: caller });
         }
 
-        // Usuario: elimina su alias
         #[external(v0)]
         fn remove_my_alias(ref self: ContractState) {
             let caller = get_caller_address();
@@ -206,10 +207,10 @@ mod alias_cbu {
             self.addr_to_alias.write(caller_f, ZERO_FELT);
             self.alias_to_addr.write(key, felt_to_addr(ZERO_FELT));
 
-            self.emit(Event::AliasRemoved(AliasRemoved { alias_key: key, who: caller }));
+            self.emit(AliasRemoved { alias_key: key, who: caller });
         }
 
-        // ===== Admin =====
+        // ==== admin ====
         #[external(v0)]
         fn admin_register_for(
             ref self: ContractState,
@@ -232,7 +233,7 @@ mod alias_cbu {
             self.alias_to_addr.write(alias_key, who);
             self.addr_to_alias.write(who_f, alias_key);
 
-            self.emit(Event::AliasRegistered(AliasRegistered { alias_key, who }));
+            self.emit(AliasRegistered { alias_key, who });
         }
 
         #[external(v0)]
@@ -246,7 +247,7 @@ mod alias_cbu {
             self.alias_to_addr.write(alias_key, felt_to_addr(ZERO_FELT));
             self.addr_to_alias.write(who_f, ZERO_FELT);
 
-            self.emit(Event::AliasRemoved(AliasRemoved { alias_key, who }));
+            self.emit(AliasRemoved { alias_key, who });
         }
 
         #[external(v0)]
@@ -254,9 +255,7 @@ mod alias_cbu {
             assert_owner(@self);
             let prev = self.owner.read();
             self.owner.write(new_owner);
-            self.emit(Event::OwnershipTransferred(OwnershipTransferred {
-                previous_owner: prev, new_owner
-            }));
+            self.emit(OwnershipTransferred { previous_owner: prev, new_owner });
         }
 
         #[external(v0)]
@@ -264,7 +263,7 @@ mod alias_cbu {
             assert_owner(@self);
             self.fee_token.write(token);
             self.fee_amount.write(amount);
-            self.emit(Event::FeeConfigUpdated(FeeConfigUpdated { token, amount }));
+            self.emit(FeeConfigUpdated { token, amount });
         }
     }
 }

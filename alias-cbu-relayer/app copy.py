@@ -151,8 +151,8 @@ async def submit(data: SubmitIn):
     )
     alias_register = Call(
         to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]   # <— importantísimo: pasa el 'who'
+        selector=get_selector_from_name("register_my_alias"),
+        calldata=[k, ln]
     )
 
     try:

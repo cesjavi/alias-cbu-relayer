@@ -62,6 +62,21 @@
     <div id="prep" class="mono" style="white-space:pre-wrap; margin-top:1rem; font-size: 0.85em;"></div>
     <div id="out" style="margin-top:1rem;"></div>
   </div>
+<div class="card">
+  <h3>Buscar / Resolver</h3>
+  <div class="row">
+    <input id="q-alias" placeholder="alias (p.ej. pepe.123)" style="flex:1; font-family:monospace;">
+    <button id="btn-resolve-alias">Alias → Address</button>
+  </div>
+  <div class="row" style="margin-top:.5rem;">
+    <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
+    <button id="btn-resolve-addr">Address → Alias</button>
+  </div>
+  <div class="row" style="margin-top:.5rem;">
+    <button id="btn-list">Listar (índice local del relayer)</button>
+  </div>
+  <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
+</div>
 
 <script type="module">
   const $ = (id) => document.getElementById(id);
@@ -378,6 +393,46 @@ async function signTypedMessageWithFallback(account, typed) {
       log(`Error: ${e.message}`, 'err');
     }
   };
+  async function getJSON(url) {
+  const r = await fetch(url);
+  const t = await r.text();
+  let d = null;
+  try { d = t ? JSON.parse(t) : null; } catch {}
+  if (!r.ok) throw new Error(d?.detail || d?.error || t || `HTTP ${r.status}`);
+  return d ?? {};
+}
+
+$("btn-resolve-alias").onclick = async () => {
+  const alias = $("q-alias").value.trim();
+  if (!alias) { alert("Ingresá un alias"); return; }
+  try {
+    const r = await getJSON(`/api/resolve_alias?alias=${encodeURIComponent(alias)}`);
+    $("resolve-out").textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    $("resolve-out").textContent = "Error: " + (e.message || e);
+  }
+};
+
+$("btn-resolve-addr").onclick = async () => {
+  const addr = $("q-addr").value.trim();
+  if (!addr) { alert("Ingresá un address 0x"); return; }
+  try {
+    const r = await getJSON(`/api/resolve_address?address=${encodeURIComponent(addr)}`);
+    $("resolve-out").textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    $("resolve-out").textContent = "Error: " + (e.message || e);
+  }
+};
+
+$("btn-list").onclick = async () => {
+  try {
+    const r = await getJSON("/list");
+    $("resolve-out").textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    $("resolve-out").textContent = "Error: " + (e.message || e);
+  }
+};
+
 </script>
 </body>
 </html>

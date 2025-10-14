@@ -151,8 +151,8 @@ async def submit(data: SubmitIn):
     )
     alias_register = Call(
         to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]   # <— importantísimo: pasa el 'who'
+        selector=get_selector_from_name("register_my_alias"),
+        calldata=[k, ln]
     )
 
     try:
@@ -238,7 +238,7 @@ async def resolve_address(address: str):
         "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None
     }
 
-@app.get("/list")
+@app.get("/api/list")
 async def list_local():
     """
     Lista el índice en memoria (solo los alias que pasaron por ESTE relayer en esta ejecución).
