@@ -282,18 +282,22 @@ async def submit(data: SubmitIn):
         print("[warn] estimate failed, usando fee fijo:", e)
         fee_value = SAFE_FEE
 
-    # ===== Ejecutar (compatibilidad fee / max_fee) =====
-    import inspect
-    sig = inspect.signature(relayer.execute_v3)
-    kwargs = {"auto_estimate": False}
-    if "max_fee" in sig.parameters:
-        kwargs["max_fee"] = fee_value
-    elif "fee" in sig.parameters:
-        kwargs["fee"] = fee_value
-    else:
-        raise HTTPException(500, "La versión de starknet_py no soporta fee ni max_fee")
-
+    
+    # ===== Ejecutar con compatibilidad total (v0.27+ incluido) =====
     try:
+        import inspect
+        sig = inspect.signature(relayer.execute_v3)
+        kwargs = {}
+
+        if "auto_estimate" in sig.parameters:
+            # Versión moderna: usar auto_estimate=True
+            kwargs["auto_estimate"] = True
+        elif "estimate_fee_mode" in sig.parameters:
+            # Alternativa de 0.27.x+
+            kwargs["estimate_fee_mode"] = "auto"
+        else:
+            print("[warn] execute_v3 sin auto_estimate, intentando vacío")
+
         resp = await relayer.execute_v3(
             calls=[erc20_transfer_from, alias_register],
             **kwargs
@@ -301,6 +305,7 @@ async def submit(data: SubmitIn):
         tx_hash = getattr(resp, "transaction_hash", resp)
     except Exception as e:
         raise HTTPException(500, f"Error enviando tx: {e}")
+
 
     # Índice en memoria
     alias_key_hex = hex(k)
