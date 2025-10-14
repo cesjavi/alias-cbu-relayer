@@ -351,35 +351,46 @@ async def submit(data: SubmitIn):
         calldata=[k, ln, user]   # <— pasa el 'who'
     )
 
-    # ===== Estimar con 'pending' y fallback a fee fijo =====
-    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK (ajustá si hace falta)
+        # ===== Estimar con 'pending' y fallback a fee fijo =====
+    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK
     try:
-        # algunos RPC fallan con 'latest'; usamos 'pending'
-        block_id = BlockId(tag=Tag.PENDING)
-
-        # método interno pero estable para v3; si no existe en tu versión, se captura en except
-        est = await relayer._estimate_fee(
-            calls=[erc20_transfer_from, alias_register],
-            block_id=block_id,
-            version=3,
-            nonce=None
-        )
-        max_fee = int(est.overall_fee * 13 // 10)  # +30% colchón
+        if hasattr(relayer, "_estimate_fee"):
+            est = await relayer._estimate_fee(
+                calls=[erc20_transfer_from, alias_register],
+                block_id=block_id_pending,
+                version=3,
+                nonce=None
+            )
+            max_fee = int(est.overall_fee * 13 // 10)
+        else:
+            raise Exception("_estimate_fee no disponible")
     except Exception as e:
         print("[warn] estimate failed, using SAFE_MAX_FEE fallback:", e)
         max_fee = SAFE_MAX_FEE_FALLBACK
 
+    # ===== Ejecutar la transacción (compatibilidad entre versiones) =====
     try:
+        # versiones nuevas aceptan 'max_fee', viejas solo 'fee'
+        kwargs = {"auto_estimate": False}
+        try:
+            relayer.execute_v3.__signature__  # prueba de introspección
+            # usamos 'fee' por compatibilidad si no acepta 'max_fee'
+            import inspect
+            if "max_fee" in inspect.signature(relayer.execute_v3).parameters:
+                kwargs["max_fee"] = max_fee
+            else:
+                kwargs["fee"] = max_fee
+        except Exception:
+            kwargs["fee"] = max_fee
+
         resp = await relayer.execute_v3(
             calls=[erc20_transfer_from, alias_register],
-            auto_estimate=False,
-            max_fee=max_fee
+            **kwargs
         )
-        tx_hash = resp.transaction_hash
-    except ClientError as ce:
-        raise HTTPException(500, f"Error enviando tx (client): {ce}")
+        tx_hash = getattr(resp, "transaction_hash", resp)
     except Exception as e:
         raise HTTPException(500, f"Error enviando tx: {e}")
+
 
     # Índice en memoria
     alias_key_hex = hex(k)
