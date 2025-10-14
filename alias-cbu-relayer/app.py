@@ -541,6 +541,7 @@ async def resolve_alias(alias: str):
 
 @app.get("/api/resolve_address")
 async def resolve_address(address: str):
+    # 1) parsear address
     try:
         addr_int = int(address, 16)
     except ValueError:
@@ -550,27 +551,67 @@ async def resolve_address(address: str):
     try:
         from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
 
-        # 👇 igual: block_number="latest"
+    # 2) llamar a la view on-chain: alias_of_addr(address) -> felt252
+    try:
         res = await client.call_contract(
+            call=Call(
+                to_addr=ALIAS_CONTRACT,
+                selector=get_selector_from_name("alias_of_addr"),
+                calldata=[addr_int],
+            ),
+            block_number="latest",   # starknet-py 0.28.x
+        )
+        alias_felt = int(res[0]) if res else 0
+    except Exception as e:
+        raise HTTPException(500, f"Error on-chain: {e}")
+
+    # 3) decodificar felt -> ascii (si corresponde)
+    def felt_to_ascii(f: int) -> str:
+        if f == 0:
+            return ""
+        # 32 bytes big-endian, quitar ceros a la izquierda y decodificar
+        raw = f.to_bytes(32, "big").lstrip(b"\x00")
+        try:
+            s = raw.decode("ascii", errors="ignore")
+        except Exception:
+            return ""
+        # filtrar por tu regex permitida (a-z 0-9 .)
+        s = "".join(ch for ch in s if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == ".")
+        return s
+
+    alias_text = felt_to_ascii(alias_felt) or None
+
+    # 4) opcional: también devolver la key on-chain (si tu contrato la expone)
+    onchain_key = None
+    try:
+        res2 = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_key_of_addr"),
                 calldata=[addr_int],
             ),
-            block_number="latest"
+            block_number="latest",
         )
+        onchain_key = hex(res2[0]) if res2 else None
+    except Exception:
+        # ignoramos si no existe o falla
+        pass
 
-        onchain_key = hex(res[0])
-    except Exception as e:
-        raise HTTPException(500, f"Error on-chain: {e}")
-
+    # 5) mirar índice en memoria (si lo tuviéramos por este relayer)
     mem = ADDR_INDEX.get(hex(addr_int))
+    alias_from_mem = mem[1] if mem else None
+
     return {
         "address": hex(addr_int),
-        "onchain_alias_key": onchain_key,
+        "alias_felt_hex": hex(alias_felt),
+        "alias": alias_text or alias_from_mem,   # <- texto si pudimos decodificar o si lo tenemos en memoria
+        "onchain_alias_key": onchain_key,        # opcional, si tu contrato la provee
         "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None,
     }
+
 
 @app.get("/api/list")
 async def list_local():
