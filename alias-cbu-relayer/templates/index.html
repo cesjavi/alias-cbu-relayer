@@ -30,7 +30,7 @@
   <div class="alert alert-danger">
     <strong>🔴 ERROR React #310 - Es un BUG de la extensión</strong><br/><br/>
     <strong>SOLUCIONES que funcionan:</strong><br/>
-    1. ✅ <strong>Usar FIREFOX</strong> (la extensión funciona mejor ahí)<br/>
+    1. ✅ <strong>Usar FIREFOX</strong><br/>
     2. ✅ Actualizar ArgentX/Braavos a la última versión<br/>
     3. ✅ Probar en otro navegador (Brave, Edge)<br/>
     4. ❌ NO es un problema de este código<br/><br/>
@@ -84,9 +84,13 @@
   <div id="wallet-ok"></div>
   <div id="wallet-error"></div>
 
-  <!-- CONFIG: Si no tenés backend en este deploy, dejá API_BASE = "" -->
+  <!-- API_BASE vacío = MISMO dominio (Vercel sirve app.py en /api/*) -->
   <script>
-    const API_BASE = ""; // <-- PONÉ la URL completa de tu backend si existe, p.ej "https://mi-relayer.example.com"
+    const API_BASE = ""; 
+    const apiUrl = (path) => {
+      const base = API_BASE ? API_BASE.replace(/\/$/, "") : "";
+      return `${base}${path}`;
+    };
   </script>
 
   <script>
@@ -95,29 +99,18 @@
     const okEl = $("wallet-ok");
     const errEl = $("wallet-error");
 
-    function shortHex(h) {
-      if (!h) return "";
-      const s = h.replace(/^0x/, "");
-      return "0x" + s.slice(0, 6) + "…" + s.slice(-6);
-    }
-
-    function showError(msg, noAlert=false) {
-      console.error(msg);
-      if (errEl) errEl.textContent = msg;
-      if (!noAlert) alert(msg);
-    }
-
+    function shortHex(h){ if(!h) return ""; const s=h.replace(/^0x/,""); return "0x"+s.slice(0,6)+"…"+s.slice(-6); }
+    function showError(msg){ console.error(msg); errEl && (errEl.textContent = msg); alert(msg); }
     function log(m, type = 'info') {
       const icons = { info: 'ℹ️', ok: '✅', err: '❌', warn: '⚠️' };
       const classes = { info: '', ok: 'ok', err: 'err', warn: 'warn' };
       console.log("[aliascbu]", m);
-      const html = `<span class="${classes[type]}">${icons[type]} ${
+      $("out").innerHTML = `<span class="${classes[type]}">${icons[type]} ${
         typeof m === "string" ? m.replace(/\n/g, '<br/>') : JSON.stringify(m, null, 2)
       }</span>`;
-      $("out").innerHTML = html;
     }
 
-    // Utilities
+    // ===== Utils Cairo/hex =====
     const FIELD_P = (2n ** 251n) + (17n * (2n ** 192n)) + 1n;
     const strip0x = (h) => (h || "").toLowerCase().replace(/^0x/, "");
     const padHex64 = (h) => "0x" + strip0x(h).padStart(64, "0");
@@ -134,13 +127,11 @@
       };
     };
 
-    // typed data builder (compatible con tu backend)
     function buildTypedData(alias_key_hex, len, user_hex, nonce, chainId_hex) {
       const cleanHex = (h) => {
         const s = strip0x(h);
         return "0x" + (s.replace(/^0+/, "") || "0");
       };
-
       return {
         types: {
           StarkNetDomain: [
@@ -170,68 +161,42 @@
       };
     }
 
-    // Wait for wallet injection (manual connect flow uses this)
     function waitForWallets(ms = 8000) {
       return new Promise((resolve) => {
-        const start = Date.now();
-
-        function kick() {
+        const kick = () => {
           const sn = window.starknet || null;
           const argentx = (sn && sn.isArgentX) ? sn : (window.starknet_argentX || null);
           const braavos = (sn && sn.isBraavos) ? sn : (window.starknet_braavos || window.braavos || null);
-
           resolve({ braavos, argentx });
-        }
-
-        // if already present
-        if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) {
-          return kick();
-        }
-
-        // listen for standard event
+        };
+        if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) return kick();
         window.addEventListener('starknet#initialized', () => kick(), { once: true });
-
-        // fallback timeout
         setTimeout(kick, ms);
       });
     }
 
-    // Attempt to connect by trying known providers
     async function connectDirect() {
       const { braavos, argentx } = await waitForWallets(8000);
-
       const candidates = [
         { name: 'ArgentX', obj: argentx },
         { name: 'Braavos', obj: braavos },
         { name: 'Braavos (legacy)', obj: window.braavos }
       ];
-
       for (const { name, obj } of candidates) {
         if (!obj) continue;
         try {
-          if (typeof obj.enable === 'function') {
-            await obj.enable({ starknetVersion: 'v5' });
-          } else if (obj.request) {
-            // some wallets expose other request shapes
-            await obj.request({ type: 'wallet_requestAccounts' });
-          }
-
+          if (typeof obj.enable === 'function') await obj.enable({ starknetVersion: 'v5' });
+          else if (obj.request) await obj.request({ type: 'wallet_requestAccounts' });
           const acc = obj.account || obj.selectedAccount || obj;
-          if (acc?.address) {
-            return { account: acc, address: acc.address, name };
-          }
-
-          // fallback: some wallets set selectedAddress
+          if (acc?.address) return { account: acc, address: acc.address, name };
           if (obj.selectedAddress) return { account: obj, address: obj.selectedAddress, name };
         } catch (e) {
           console.warn(`${name} falló:`, e?.message || e);
         }
       }
-
       throw new Error("No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
     }
 
-    // DOM wiring & logic
     let account = null, userAddr = null, prepared = null, cfg = null;
 
     function enableButtons(p, a, s, su) {
@@ -250,7 +215,6 @@
       return d ?? {};
     }
 
-    // BUTTON: Connect
     $("btn-connect").onclick = async () => {
       try {
         log("Conectando wallet...");
@@ -259,17 +223,8 @@
         userAddr = padHex64(conn.address);
         $("acc").textContent = `${userAddr.slice(0,10)}...${userAddr.slice(-8)} (${conn.name})`;
 
-        if (!API_BASE) {
-          log("Conectado, pero API_BASE no configurado. Para usar prepare/submit necesitás un backend.", "warn");
-          okEl && (okEl.textContent = `Conectado: ${shortHex(userAddr)} (${conn.name}). Backend no configurado.`);
-          // Enable only prepare if you want to allow local-only flows; here we require backend
-          enableButtons(false, false, false, false);
-          return;
-        }
-
-        // fetch config from backend
         log("Obteniendo configuración desde backend...", "info");
-        const res = await fetch(`${API_BASE}/api/config`);
+        const res = await fetch(apiUrl("/api/config"));
         if (!res.ok) throw new Error(await res.text());
         cfg = await res.json();
 
@@ -281,32 +236,29 @@
         enableButtons(true, false, false, false);
       } catch (e) {
         log(`Error: ${e.message}\n\nProbá:\n• Recargar (Ctrl+Shift+R)\n• Usar Firefox\n• Actualizar extensión`, 'err');
-        showError(e.message, true);
+        showError(e.message);
       }
     };
 
-    // BUTTON: Reset
     $("btn-reset").onclick = () => {
       account = userAddr = prepared = cfg = null;
       $("acc").textContent = "";
       $("prep").textContent = "";
-      enableButtons(false, false, false, false);
       $("resolve-out").textContent = "";
       $("out").innerHTML = "";
       okEl && (okEl.textContent = "");
       errEl && (errEl.textContent = "");
+      enableButtons(false, false, false, false);
       log("Reset OK");
     };
 
-    // BUTTON: Prepare
     $("btn-prepare").onclick = async () => {
       if (!userAddr) { alert("Conectá wallet"); return; }
       const alias = $("alias").value.trim();
       if (!alias) { alert("Ingresá un alias"); return; }
-      if (!API_BASE) { showError("Backend no configurado (API_BASE vacío). No puedo preparar.", true); return; }
 
       try {
-        const res = await fetch(`${API_BASE}/api/prepare`, {
+        const res = await fetch(apiUrl("/api/prepare"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_address: userAddr, alias })
@@ -321,7 +273,6 @@
       }
     };
 
-    // BUTTON: Approve (ERC20 approve to relayer)
     $("btn-approve").onclick = async () => {
       if (!prepared || !account) { alert("Falta preparar"); return; }
       try {
@@ -331,13 +282,11 @@
           entrypoint: "approve",
           calldata: [ cfg.relayer_address, amount.low, amount.high ]
         };
-
         const SAFE_MAX_FEE = "0x1DCD65000";
         const res = await account.execute([approveCall], undefined, {
           version: "0x3",
           maxFee: SAFE_MAX_FEE
         });
-
         const txHash = res.transaction_hash || res;
         log(`Approve enviado (v3 STRK)!\nTx: ${txHash}\nAhora firmá el mensaje.`, "ok");
         enableButtons(true, true, true, false);
@@ -346,7 +295,6 @@
       }
     };
 
-    // Sign message with fallbacks
     async function signTypedMessageWithFallback(accountObj, typed) {
       try {
         let sig = await accountObj.signMessage(typed);
@@ -355,30 +303,20 @@
       } catch (e) {
         console.warn("signMessage estándar falló, probando Braavos.request:", e);
       }
-
       const br = window.starknet_braavos || window.braavos;
       if (br?.request) {
-        let sig = await br.request({
-          type: "braavos_signMessage",
-          params: typed,
-        });
+        let sig = await br.request({ type: "braavos_signMessage", params: typed });
         if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
         return sig;
       }
-
-      throw new Error("No se pudo firmar el mensaje (Braavos/ArgentX no disponible para firmar).");
+      throw new Error("No se pudo firmar el mensaje.");
     }
 
-    // BUTTON: Sign
     $("btn-sign").onclick = async () => {
       if (!prepared || !account) { alert("Falta preparar"); return; }
       try {
         const typed = buildTypedData(
-          prepared.alias_key,
-          prepared.len,
-          userAddr,
-          prepared.nonce,
-          cfg.chain_id
+          prepared.alias_key, prepared.len, userAddr, prepared.nonce, cfg.chain_id
         );
         const sig = await signTypedMessageWithFallback(account, typed);
         prepared.signature = sig;
@@ -390,15 +328,11 @@
       }
     };
 
-    // BUTTON: Submit
     $("btn-submit").onclick = async () => {
       if (!prepared?.signature) { alert("Falta firmar"); return; }
-      if (!API_BASE) { showError("Backend no configurado (API_BASE vacío). No puedo enviar.", true); return; }
-
       try {
         log("Enviando al relayer...", 'info');
-
-        const res = await fetch(`${API_BASE}/api/submit`, {
+        const res = await fetch(apiUrl("/api/submit"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -408,12 +342,9 @@
             nonce: prepared.nonce
           })
         });
-
         if (!res.ok) throw new Error(await res.text());
         const out = await res.json();
-
-        log(`✅ REGISTRO EXITOSO!\n\nTx: ${out.tx_hash}\nRelayer: ${out.relayer}\n\nPodés ver la tx en Starkscan/Voyager`, 'ok');
-
+        log(`✅ REGISTRO EXITOSO!\n\nTx: ${out.tx_hash}\nRelayer: ${out.relayer}`, 'ok');
         prepared = null;
         $("prep").textContent = "";
         $("alias").value = "";
@@ -423,13 +354,11 @@
       }
     };
 
-    // Resolve helper buttons (use API_BASE)
     $("btn-resolve-alias").onclick = async () => {
       const alias = $("q-alias").value.trim();
       if (!alias) { alert("Ingresá un alias"); return; }
-      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
       try {
-        const r = await getJSON(`${API_BASE}/api/resolve_alias?alias=${encodeURIComponent(alias)}`);
+        const r = await getJSON(apiUrl(`/api/resolve_alias?alias=${encodeURIComponent(alias)}`));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
@@ -439,9 +368,8 @@
     $("btn-resolve-addr").onclick = async () => {
       const addr = $("q-addr").value.trim();
       if (!addr) { alert("Ingresá un address 0x"); return; }
-      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
       try {
-        const r = await getJSON(`${API_BASE}/api/resolve_address?address=${encodeURIComponent(addr)}`);
+        const r = await getJSON(apiUrl(`/api/resolve_address?address=${encodeURIComponent(addr)}`));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
@@ -449,16 +377,14 @@
     };
 
     $("btn-list").onclick = async () => {
-      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
       try {
-        const r = await getJSON(`${API_BASE}/list`);
+        const r = await getJSON(apiUrl("/list"));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
       }
     };
 
-    // Initially disable buttons
     enableButtons(false, false, false, false);
   })();
   </script>
