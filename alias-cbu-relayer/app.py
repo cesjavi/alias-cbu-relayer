@@ -674,3 +674,12 @@ async def faucet(req: Request):
     except Exception as e:
         raise HTTPException(500, f"Error enviando faucet: {e}")
 
+from fastapi.responses import FileResponse
+import os
+
+@app.get("/aliascbu.js", include_in_schema=False)
+def serve_aliascbu():
+    js_path = os.path.join(os.path.dirname(__file__), "public", "aliascbu.js")
+    if os.path.exists(js_path):
+        return FileResponse(js_path, media_type="application/javascript")
+    return {"detail": "Not Found"}
