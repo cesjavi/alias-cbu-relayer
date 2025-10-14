@@ -679,7 +679,13 @@ import os
 
 @app.get("/aliascbu.js", include_in_schema=False)
 def serve_aliascbu():
-    js_path = os.path.join(os.path.dirname(__file__), "public", "aliascbu.js")
-    if os.path.exists(js_path):
-        return FileResponse(js_path, media_type="application/javascript")
-    return {"detail": "Not Found"}
+    # Intentar rutas posibles
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "public", "aliascbu.js"),
+        os.path.join(os.getcwd(), "public", "aliascbu.js"),
+        "/var/task/public/aliascbu.js"  # ruta habitual en Vercel
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return FileResponse(p, media_type="application/javascript")
+    return {"detail": f"Not Found: tried {candidates}"}
