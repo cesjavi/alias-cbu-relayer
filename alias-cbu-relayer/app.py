@@ -241,6 +241,106 @@ async def submit(data: SubmitIn):
     except Exception:
         raise HTTPException(400, "Firma inválida (hex)")
 
+    # --- Construcción de la tx ---
+    client, relayer = _get_client_and_relayer()
+    try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
+            block_id_pending = BlockId(tag=Tag.PENDING)
+        except Exception:
+            block_id_pending = "pending"
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    erc20_transfer_from = Call(
+        to_addr=AIC_TOKEN,
+        selector=get_selector_from_name("transfer_from"),
+        calldata=[user, relayer.address, FEE_AIC_WEI, 0]
+    )
+    alias_register = Call(
+        to_addr=ALIAS_CONTRACT,
+        selector=get_selector_from_name("admin_register_for"),
+        calldata=[k, ln, user]
+    )
+
+    # ===== Estimar fee con fallback =====
+    SAFE_FEE = int(5e17)  # 0.5 STRK
+    try:
+        if hasattr(relayer, "_estimate_fee"):
+            est = await relayer._estimate_fee(
+                calls=[erc20_transfer_from, alias_register],
+                block_id=block_id_pending,
+                version=3,
+                nonce=None
+            )
+            fee_value = int(est.overall_fee * 13 // 10)
+        else:
+            raise Exception("_estimate_fee no disponible")
+    except Exception as e:
+        print("[warn] estimate failed, usando fee fijo:", e)
+        fee_value = SAFE_FEE
+
+    # ===== Ejecutar (compatibilidad fee / max_fee) =====
+    import inspect
+    sig = inspect.signature(relayer.execute_v3)
+    kwargs = {"auto_estimate": False}
+    if "max_fee" in sig.parameters:
+        kwargs["max_fee"] = fee_value
+    elif "fee" in sig.parameters:
+        kwargs["fee"] = fee_value
+    else:
+        raise HTTPException(500, "La versión de starknet_py no soporta fee ni max_fee")
+
+    try:
+        resp = await relayer.execute_v3(
+            calls=[erc20_transfer_from, alias_register],
+            **kwargs
+        )
+        tx_hash = getattr(resp, "transaction_hash", resp)
+    except Exception as e:
+        raise HTTPException(500, f"Error enviando tx: {e}")
+
+    # Índice en memoria
+    alias_key_hex = hex(k)
+    addr_hex = hex(user)
+    ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
+    ADDR_INDEX[addr_hex] = (alias_key_hex, alias_norm)
+
+    return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
+
+async def submit(data: SubmitIn):
+    # Validaciones básicas
+    try:
+        alias_norm = normalize_alias(data.alias)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    k = alias_key(alias_norm)
+    ln = len(alias_norm)
+
+    try:
+        user = int(data.user_address, 16)
+    except ValueError:
+        raise HTTPException(400, "user_address inválido (hex)")
+
+    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
+        raise HTTPException(400, "Nonce invalido (prepare faltante)")
+
+    # Firma (passthrough)
+    if data.signature and len(data.signature) >= 2:
+        r_hex, s_hex = data.signature[0], data.signature[1]
+    else:
+        if not (data.signature_r and data.signature_s):
+            raise HTTPException(400, "Falta firma (signature o r/s)")
+        r_hex, s_hex = data.signature_r, data.signature_s
+
+    try:
+        int(r_hex, 16); int(s_hex, 16)
+    except Exception:
+        raise HTTPException(400, "Firma inválida (hex)")
+
     client, relayer = _get_client_and_relayer()
     try:
         from starknet_py.net.client_models import Call
