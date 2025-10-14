@@ -66,6 +66,10 @@
     <div class="row" style="margin-top:.5rem;">
       <button id="btn-list">Listar (índice local del relayer)</button>
     </div>
+    <div class="row" style="margin-top:.5rem;">
+  <button id="btn-faucet" style="background:#0a0; color:#fff;">🚰 Faucet AIC</button>
+</div>
+
     <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
   </div>
 
@@ -372,6 +376,26 @@
         $("resolve-out").textContent = "Error: " + (e.message || e);
       }
     };
+
+    $("btn-faucet").onclick = async () => {
+  try {
+    if (!userAddr) {
+      alert("Conectá la wallet primero");
+      return;
+    }
+    const res = await fetch("/api/faucet", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: userAddr })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    log(`✅ Faucet enviado!\nTx: ${data.tx_hash}\nTo: ${data.to}\nAmount: 10 AIC`, "ok");
+  } catch (e) {
+    log("Error faucet: " + (e.message || e), "err");
+  }
+};
+
 
     enableButtons(false, false, false, false);
   })();

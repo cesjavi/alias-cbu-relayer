@@ -577,3 +577,59 @@ async def list_local():
     items = [{"alias": alias, "alias_key": k, "address": addr} for k, (addr, alias) in ALIAS_INDEX.items()]
     items.sort(key=lambda x: x["alias"])
     return {"count": len(items), "items": items}
+
+# ============================================================
+# FAUCET (envía AIC a la billetera conectada, solo para pruebas)
+# ============================================================
+@app.post("/api/faucet")
+async def faucet(req: Request):
+    """
+    Envía una pequeña cantidad de AIC (ej: 10 AIC) al address indicado.
+    Usa el relayer como cuenta emisora (debe tener saldo AIC).
+    """
+    try:
+        data = await req.json()
+        dest_hex = data.get("address", "")
+        if not dest_hex or not dest_hex.startswith("0x"):
+            raise HTTPException(400, "Falta o es inválida la dirección destino (address)")
+
+        dest_int = int(dest_hex, 16)
+    except Exception as e:
+        raise HTTPException(400, f"JSON inválido: {e}")
+
+    client, relayer = _get_client_and_relayer()
+    try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    # ---- definir monto coherente ----
+    # 10 AIC * 10^18 (asumiendo 18 decimales)
+    FAUCET_AMOUNT = 1000 * (10**18)
+    low = FAUCET_AMOUNT & ((1 << 128) - 1)
+    high = FAUCET_AMOUNT >> 128
+
+    faucet_call = Call(
+        to_addr=AIC_TOKEN,
+        selector=get_selector_from_name("transfer"),
+        calldata=[dest_int, low, high],
+    )
+
+    try:
+        # versión moderna con auto_estimate=True
+        resp = await relayer.execute_v3(
+            calls=[faucet_call],
+            auto_estimate=True,
+        )
+        tx_hash = getattr(resp, "transaction_hash", resp)
+        return {
+            "ok": True,
+            "tx_hash": hex(tx_hash),
+            "relayer": hex(relayer.address),
+            "to": dest_hex,
+            "amount_aic": str(FAUCET_AMOUNT),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Error enviando faucet: {e}")
+
