@@ -3,54 +3,108 @@ load_dotenv()
 
 import os, re
 from typing import Optional, Dict, Tuple
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from api.rpc_proxy import router as rpc_router
-from api.estimate_v3 import  router as est_router
-
 from pydantic import BaseModel
 
-from starknet_py.net.full_node_client import FullNodeClient
-from starknet_py.net.account.account import Account
-from starknet_py.net.client_models import Call
-from starknet_py.hash.selector import get_selector_from_name
-from starknet_py.net.signer.stark_curve_signer import KeyPair
-from eth_hash.auto import keccak as keccak256
+# ==== Routers opcionales (no deben romper import-time) ====
+rpc_router = est_router = None
+try:
+    from api.rpc_proxy import router as _rpc_router
+    rpc_router = _rpc_router
+except Exception as e:
+    print("[warn] rpc_proxy no disponible:", e)
 
-RPC_URL = os.getenv("RPC_URL")
-ALIAS_CONTRACT = int(os.getenv("ALIAS_CONTRACT", "0"), 16)
-AIC_TOKEN = int(os.getenv("AIC_TOKEN", "0"), 16)
-RELAYER_ACCOUNT_ADDRESS = int(os.getenv("RELAYER_ACCOUNT_ADDRESS", "0"), 16)
-RELAYER_PRIVATE_KEY = int(os.getenv("RELAYER_PRIVATE_KEY", "0"), 16)
-FEE_AIC_WEI = int(os.getenv("FEE_AIC_WEI", "0"))
-CHAIN_ID = int(os.getenv("CHAIN_ID", "0"), 16)
+try:
+    from api.estimate_v3 import router as _est_router
+    est_router = _est_router
+except Exception as e:
+    print("[warn] estimate_v3 no disponible:", e)
 
-if not (RPC_URL and ALIAS_CONTRACT and AIC_TOKEN and RELAYER_ACCOUNT_ADDRESS and RELAYER_PRIVATE_KEY and FEE_AIC_WEI and CHAIN_ID):
-    raise RuntimeError("Faltan variables de entorno (.env)")
+# ==== CARGA ENV – NO rompas en import-time ====
+def _get_env_hex(name: str, default: str = "0x0") -> int:
+    """Devuelve int interpretando hex/decimal; tolerante a vacíos."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return int(default, 16)
+    try:
+        if raw.lower().startswith("0x"):
+            return int(raw, 16)
+        return int(raw)  # decimal
+    except Exception:
+        return int(default, 16)
 
-client = FullNodeClient(node_url=RPC_URL)
-relayer = Account(
-    client=client,
-    address=RELAYER_ACCOUNT_ADDRESS,
-    key_pair=KeyPair.from_private_key(RELAYER_PRIVATE_KEY),
-    chain=CHAIN_ID,
-)
+def _get_env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
 
+RPC_URL = _get_env_str("RPC_URL", "")
+ALIAS_CONTRACT = _get_env_hex("ALIAS_CONTRACT", "0x0")
+AIC_TOKEN = _get_env_hex("AIC_TOKEN", "0x0")
+RELAYER_ACCOUNT_ADDRESS = _get_env_hex("RELAYER_ACCOUNT_ADDRESS", "0x0")
+RELAYER_PRIVATE_KEY = _get_env_hex("RELAYER_PRIVATE_KEY", "0x0")
+FEE_AIC_WEI = int(os.getenv("FEE_AIC_WEI", "0") or "0")
+CHAIN_ID = _get_env_hex("CHAIN_ID", "0x1")  # por defecto 0x1
+
+# ==== App FastAPI ====
 app = FastAPI(title="AliasCBU Relayer (Gasless AIC)")
 templates = Jinja2Templates(directory="templates")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-app.include_router(rpc_router, prefix="/api")
-app.include_router(est_router, prefix="/api")
 
+if rpc_router:
+    app.include_router(rpc_router, prefix="/api")
+if est_router:
+    app.include_router(est_router, prefix="/api")
+
+# ==== Validaciones de entorno por endpoint ====
+def _missing_envs_for_tx():
+    missing = []
+    if not RPC_URL: missing.append("RPC_URL")
+    if not ALIAS_CONTRACT: missing.append("ALIAS_CONTRACT")
+    if not AIC_TOKEN: missing.append("AIC_TOKEN")
+    if not RELAYER_ACCOUNT_ADDRESS: missing.append("RELAYER_ACCOUNT_ADDRESS")
+    if not RELAYER_PRIVATE_KEY: missing.append("RELAYER_PRIVATE_KEY")
+    if not FEE_AIC_WEI: missing.append("FEE_AIC_WEI")
+    if not CHAIN_ID: missing.append("CHAIN_ID")
+    return missing
+
+# ==== Lazy init de starknet_py ====
+_client = None
+_relayer = None
+def _get_client_and_relayer():
+    global _client, _relayer
+    if _client and _relayer:
+        return _client, _relayer
+
+    missing = _missing_envs_for_tx()
+    if missing:
+        raise HTTPException(500, f"Faltan variables de entorno: {', '.join(missing)}")
+
+    try:
+        from starknet_py.net.full_node_client import FullNodeClient
+        from starknet_py.net.account.account import Account
+        from starknet_py.net.signer.stark_curve_signer import KeyPair
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    _client = FullNodeClient(node_url=RPC_URL)
+    _relayer = Account(
+        client=_client,
+        address=RELAYER_ACCOUNT_ADDRESS,
+        key_pair=KeyPair.from_private_key(RELAYER_PRIVATE_KEY),
+        chain=CHAIN_ID,
+    )
+    return _client, _relayer
+
+# ==== Utilidades alias ====
 ALIAS_REGEX = re.compile(r"^[a-z0-9.]{4,20}$")
 NONCES: dict[str, int] = {}
 
-# Índice en memoria (solo lo que pasó por ESTE relayer)
-# alias_key_hex -> (user_address_hex, alias_str)
-ALIAS_INDEX: Dict[str, Tuple[str, str]] = {}
-ADDR_INDEX: Dict[str, Tuple[str, str]] = {}  # address_hex -> (alias_key_hex, alias_str)
+# índice en memoria
+ALIAS_INDEX: Dict[str, Tuple[str, str]] = {}  # alias_key_hex -> (user_address_hex, alias_str)
+ADDR_INDEX: Dict[str, Tuple[str, str]] = {}   # address_hex -> (alias_key_hex, alias_str)
 
 def normalize_alias(s: str) -> str:
     alias = s.strip().lower()
@@ -60,8 +114,15 @@ def normalize_alias(s: str) -> str:
 
 FIELD_P = (2**251) + (17 * 2**192) + 1
 
+def _keccak_bytes(msg: bytes) -> bytes:
+    try:
+        from eth_hash.auto import keccak as keccak256
+    except Exception as e:
+        raise HTTPException(500, f"eth_hash no disponible: {e}")
+    return keccak256(msg)
+
 def alias_key(alias: str) -> int:
-    h_bytes = keccak256(alias.encode("utf-8"))
+    h_bytes = _keccak_bytes(alias.encode("utf-8"))
     return int.from_bytes(h_bytes, "big") % FIELD_P
 
 def next_nonce(addr_hex: str) -> int:
@@ -75,6 +136,7 @@ def meta_message(alias_key_int: int, length: int, user_addr: int, nonce: int) ->
         f"len:{length}|user:{hex(user_addr)}|nonce:{nonce}|chain:{hex(CHAIN_ID)}"
     )
 
+# ==== modelos ====
 class PrepareIn(BaseModel):
     alias: str
     user_address: str
@@ -87,30 +149,54 @@ class SubmitIn(BaseModel):
     signature: Optional[list[str]] = None
     nonce: int
 
+# ==== rutas ====
 @app.get("/", response_class=HTMLResponse)
 async def index(req: Request):
     return templates.TemplateResponse("index.html", {"request": req})
 
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+
 @app.get("/api/config")
 async def config():
-    """Devuelve config sin padding en chainId (critico para firma)"""
+    """
+    Devuelve config sin romper si faltan envs; indica qué falta.
+    """
+    missing = []
+    if not RPC_URL: missing.append("RPC_URL")
+    if not ALIAS_CONTRACT: missing.append("ALIAS_CONTRACT")
+    if not AIC_TOKEN: missing.append("AIC_TOKEN")
+    if not RELAYER_ACCOUNT_ADDRESS: missing.append("RELAYER_ACCOUNT_ADDRESS")
+    if not RELAYER_PRIVATE_KEY: missing.append("RELAYER_PRIVATE_KEY")
+    if not FEE_AIC_WEI: missing.append("FEE_AIC_WEI")
+    if not CHAIN_ID: missing.append("CHAIN_ID")
+
     return {
         "relayer_address": hex(RELAYER_ACCOUNT_ADDRESS),
         "aic_token": hex(AIC_TOKEN),
         "alias_contract": hex(ALIAS_CONTRACT),
         "chain_id": hex(CHAIN_ID),
         "fee_aic_wei": str(FEE_AIC_WEI),
+        "missing_envs": missing,   # <- para debug en Vercel
     }
 
 @app.post("/api/prepare")
 async def prepare(data: PrepareIn):
-    alias_norm = normalize_alias(data.alias)
+    try:
+        alias_norm = normalize_alias(data.alias)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     k = alias_key(alias_norm)
     ln = len(alias_norm)
 
-    user_hex = data.user_address
-    user_int = int(user_hex, 16)
-    nonce = next_nonce(user_hex)
+    try:
+        user_int = int(data.user_address, 16)
+    except ValueError:
+        raise HTTPException(400, "user_address inválido (hex)")
+
+    nonce = next_nonce(data.user_address)
 
     msg = meta_message(k, ln, user_int, nonce)
     return {
@@ -125,25 +211,45 @@ async def prepare(data: PrepareIn):
 
 @app.post("/api/submit")
 async def submit(data: SubmitIn):
-    alias_norm = normalize_alias(data.alias)
+    # Validaciones básicas
+    try:
+        alias_norm = normalize_alias(data.alias)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     k = alias_key(alias_norm)
     ln = len(alias_norm)
-    user = int(data.user_address, 16)
+
+    try:
+        user = int(data.user_address, 16)
+    except ValueError:
+        raise HTTPException(400, "user_address inválido (hex)")
 
     if NONCES.get(data.user_address.lower(), 0) < data.nonce:
         raise HTTPException(400, "Nonce invalido (prepare faltante)")
 
-    # Firma: passthrough (no se verifica criptográficamente acá)
+    # Firma (passthrough)
     if data.signature and len(data.signature) >= 2:
         r_hex, s_hex = data.signature[0], data.signature[1]
     else:
         if not (data.signature_r and data.signature_s):
             raise HTTPException(400, "Falta firma (signature o r/s)")
         r_hex, s_hex = data.signature_r, data.signature_s
-    _r_int = int(r_hex, 16)
-    _s_int = int(s_hex, 16)
 
-    # Multicall: transfer_from + register
+    try:
+        int(r_hex, 16); int(s_hex, 16)
+    except Exception:
+        raise HTTPException(400, "Firma inválida (hex)")
+
+    # --- Enviar multicall ---
+    # Hacemos lazy import aquí, y construimos cliente/relayer recién ahora
+    client, relayer = _get_client_and_relayer()
+    try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
     erc20_transfer_from = Call(
         to_addr=AIC_TOKEN,
         selector=get_selector_from_name("transfer_from"),
@@ -152,7 +258,7 @@ async def submit(data: SubmitIn):
     alias_register = Call(
         to_addr=ALIAS_CONTRACT,
         selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]   # <— importantísimo: pasa el 'who'
+        calldata=[k, ln, user]   # <— pasa el 'who'
     )
 
     try:
@@ -161,7 +267,7 @@ async def submit(data: SubmitIn):
     except Exception as e:
         raise HTTPException(500, f"Error enviando tx: {e}")
 
-    # Actualizamos índice en memoria
+    # Índice en memoria
     alias_key_hex = hex(k)
     addr_hex = hex(user)
     ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
@@ -169,31 +275,24 @@ async def submit(data: SubmitIn):
 
     return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
 
-# =========================
-# NUEVOS ENDPOINTS DE RESOLUCIÓN/LISTADO
-# =========================
-
+# ===== resolvers =====
 @app.get("/api/resolve_alias")
 async def resolve_alias(alias: str):
-    """
-    Devuelve el address on-chain para un alias (string).
-    Consulta al contrato (fuente de verdad). Devuelve además lo que recuerde el índice en memoria.
-    """
     alias_norm = normalize_alias(alias)
     k = alias_key(alias_norm)
 
-    # Llamada 'addr_of_alias(felt)' al contrato
+    client, _ = _get_client_and_relayer()
     try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("addr_of_alias"),
                 calldata=[k]
             ),
-            block_hash=None,
             block_number="latest"
         )
-        # retorno: ContractAddress (felt)
         onchain_addr = hex(res[0])
     except Exception as e:
         raise HTTPException(500, f"Error on-chain: {e}")
@@ -208,26 +307,24 @@ async def resolve_alias(alias: str):
 
 @app.get("/api/resolve_address")
 async def resolve_address(address: str):
-    """
-    Devuelve el alias_key (y alias si el backend lo conoce) para un address.
-    Consulta al contrato 'alias_key_of_addr(address)' y devuelve también lo que recuerde el índice en memoria.
-    """
     try:
         addr_int = int(address, 16)
     except ValueError:
         raise HTTPException(400, "address inválido (hex)")
 
+    client, _ = _get_client_and_relayer()
     try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
         res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_key_of_addr"),
                 calldata=[addr_int]
             ),
-            block_hash=None,
             block_number="latest"
         )
-        onchain_key = hex(res[0])  # felt (alias key)
+        onchain_key = hex(res[0])
     except Exception as e:
         raise HTTPException(500, f"Error on-chain: {e}")
 
@@ -240,12 +337,6 @@ async def resolve_address(address: str):
 
 @app.get("/list")
 async def list_local():
-    """
-    Lista el índice en memoria (solo los alias que pasaron por ESTE relayer en esta ejecución).
-    Para un listado global real deberías indexar eventos (subgraph / indexer) o persistir DB.
-    """
-    items = []
-    for k, (addr, alias) in ALIAS_INDEX.items():
-        items.append({"alias": alias, "alias_key": k, "address": addr})
+    items = [{"alias": alias, "alias_key": k, "address": addr} for k, (addr, alias) in ALIAS_INDEX.items()]
     items.sort(key=lambda x: x["alias"])
     return {"count": len(items), "items": items}
