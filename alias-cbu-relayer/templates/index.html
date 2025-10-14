@@ -5,14 +5,14 @@
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Alias CBU – Gasless AIC</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 840px; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 840px; margin: 2rem auto; padding: 0 1rem; background: #fafafa; }
     label { display:block; margin-top: 1rem; font-weight: 600; }
     input, button { padding: .6rem .8rem; font-size: 1rem; }
-    button { cursor:pointer; }
+    button { cursor:pointer; border-radius: 6px; border: 1px solid #ccc; background: white; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .row { display:flex; gap:.5rem; align-items:center; flex-wrap: wrap; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
-    .card { border:1px solid #ddd; border-radius: 10px; padding: 1rem; margin-top:1rem; }
+    .card { border:1px solid #ddd; border-radius: 10px; padding: 1rem; margin-top:1rem; background: white; }
     .ok { color:#0a0; font-weight: 600; } 
     .err { color:#a00; font-weight: 600; } 
     .warn { color:#f80; font-weight: 600; }
@@ -20,6 +20,8 @@
     .alert { background: #fff3cd; border: 1px solid #ffc107; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     .alert-danger { background: #f8d7da; border-color: #f5c6cb; }
     pre { background: #f5f5f5; padding: 0.5rem; border-radius: 4px; overflow-x: auto; }
+    #wallet-ok { margin-top: .5rem; color: #086; font-weight: 600; }
+    #wallet-error { margin-top: .5rem; color: #c00; }
   </style>
 </head>
 <body>
@@ -53,7 +55,7 @@
     <input id="alias" placeholder="mi.alias" style="width:100%; font-family: monospace;"/>
 
     <div class="row" style="margin-top: .5rem;">
-      <button id="btn-prepare">1. Preparar</button>
+      <button id="btn-prepare" disabled>1. Preparar</button>
       <button id="btn-approve" disabled>2. Approve AIC</button>
       <button id="btn-sign" disabled>3. Firmar</button>
       <button id="btn-submit" disabled>4. Enviar</button>
@@ -62,443 +64,403 @@
     <div id="prep" class="mono" style="white-space:pre-wrap; margin-top:1rem; font-size: 0.85em;"></div>
     <div id="out" style="margin-top:1rem;"></div>
   </div>
-<div class="card">
-  <h3>Buscar / Resolver</h3>
-  <div class="row">
-    <input id="q-alias" placeholder="alias (p.ej. pepe.123)" style="flex:1; font-family:monospace;">
-    <button id="btn-resolve-alias">Alias → Address</button>
+
+  <div class="card">
+    <h3>Buscar / Resolver</h3>
+    <div class="row">
+      <input id="q-alias" placeholder="alias (p.ej. pepe.123)" style="flex:1; font-family:monospace;">
+      <button id="btn-resolve-alias">Alias → Address</button>
+    </div>
+    <div class="row" style="margin-top:.5rem;">
+      <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
+      <button id="btn-resolve-addr">Address → Alias</button>
+    </div>
+    <div class="row" style="margin-top:.5rem;">
+      <button id="btn-list">Listar (índice local del relayer)</button>
+    </div>
+    <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
   </div>
-  <div class="row" style="margin-top:.5rem;">
-    <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
-    <button id="btn-resolve-addr">Address → Alias</button>
-  </div>
-  <div class="row" style="margin-top:.5rem;">
-    <button id="btn-list">Listar (índice local del relayer)</button>
-  </div>
-  <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
-</div>
 
-<div id="wallet-ok"></div>
-<div id="wallet-error" style="color:#c00"></div>
+  <div id="wallet-ok"></div>
+  <div id="wallet-error"></div>
 
-<script>
-(function () {
-  const okEl = document.getElementById('wallet-ok');
-  const errEl = document.getElementById('wallet-error');
+  <!-- CONFIG: Si no tenés backend en este deploy, dejá API_BASE = "" -->
+  <script>
+    const API_BASE = ""; // <-- PONÉ la URL completa de tu backend si existe, p.ej "https://mi-relayer.example.com"
+  </script>
 
-  function showError(msg) {
-    console.error(msg);
-    if (errEl) errEl.textContent = msg;
-    alert(msg); // opcional
-  }
+  <script>
+  (function () {
+    const $ = id => document.getElementById(id);
+    const okEl = $("wallet-ok");
+    const errEl = $("wallet-error");
 
-  // Esperar a que la wallet inyecte el objeto en window
-  function waitForWallet(timeoutMs = 10000) {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-
-      function check() {
-        const braavos = window.starknet_braavos;
-        const argentX = window.starknet_argentX;
-        const legacy = window.starknet; // algunas wallets exponen este alias
-
-        if (braavos || argentX || legacy) return resolve(braavos || argentX || legacy);
-        if (Date.now() - start > timeoutMs) return reject(new Error("wallet-timeout"));
-        setTimeout(check, 200);
-      }
-
-      // algunas wallets emiten este evento al inicializar
-      window.addEventListener('starknet#initialized', () => check(), { once: true });
-      check();
-    });
-  }
-
-  async function connect() {
-    try {
-      const wallet = await waitForWallet();
-
-      // distintos métodos según wallet/versión
-      if (wallet.enable) {
-        await wallet.enable({ starknetVersion: "v5" });
-      } else if (wallet.request) {
-        await wallet.request({ type: "starknet_enable", params: { starknetVersion: "v5" } });
-      }
-
-      const addr = wallet.selectedAddress || (wallet.account && wallet.account.address);
-      if (!addr) throw new Error("no-address");
-      if (okEl) okEl.textContent = "Conectado: " + addr;
-    } catch (e) {
-      if (e && e.message === "wallet-timeout") {
-        showError("❌ No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
-      } else {
-        showError("❌ Error al conectar la wallet. Ver permisos del sitio en la extensión.");
-      }
+    function shortHex(h) {
+      if (!h) return "";
+      const s = h.replace(/^0x/, "");
+      return "0x" + s.slice(0, 6) + "…" + s.slice(-6);
     }
-  }
 
-  // Ejecutar cuando el DOM esté listo
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", connect);
-  } else {
-    connect();
-  }
-})();
-</script>
-<script >
-  const $ = (id) => document.getElementById(id);
-  
-  const log = (m, type = 'info') => { 
-    const icons = { info: 'ℹ️', ok: '✅', err: '❌', warn: '⚠️' };
-    const classes = { info: '', ok: 'ok', err: 'err', warn: 'warn' };
-    
-    console.log("[aliascbu]", m);
-    
-    const html = `<span class="${classes[type]}">${icons[type]} ${
-      typeof m === "string" ? m.replace(/\n/g, '<br/>') : JSON.stringify(m, null, 2)
-    }</span>`;
-    
-    $("out").innerHTML = html;
-  };
+    function showError(msg, noAlert=false) {
+      console.error(msg);
+      if (errEl) errEl.textContent = msg;
+      if (!noAlert) alert(msg);
+    }
 
-  const FIELD_P = (2n ** 251n) + (17n * (2n ** 192n)) + 1n;
+    function log(m, type = 'info') {
+      const icons = { info: 'ℹ️', ok: '✅', err: '❌', warn: '⚠️' };
+      const classes = { info: '', ok: 'ok', err: 'err', warn: 'warn' };
+      console.log("[aliascbu]", m);
+      const html = `<span class="${classes[type]}">${icons[type]} ${
+        typeof m === "string" ? m.replace(/\n/g, '<br/>') : JSON.stringify(m, null, 2)
+      }</span>`;
+      $("out").innerHTML = html;
+    }
 
-const strip0x = (h) => (h || "").toLowerCase().replace(/^0x/, "");
-const toFeltHex = (hex) => {
-  let n = BigInt("0x" + strip0x(hex));
-  n = ((n % FIELD_P) + FIELD_P) % FIELD_P; // reducción segura
-  return "0x" + n.toString(16);
-};
-  const padHex64 = (h) => "0x" + strip0x(h).padStart(64, "0");
-
-  const toUint256 = (value) => {
-    const bn = BigInt(value);
-    return {
-      low: "0x" + (bn & ((1n << 128n) - 1n)).toString(16),
-      high: "0x" + (bn >> 128n).toString(16)
+    // Utilities
+    const FIELD_P = (2n ** 251n) + (17n * (2n ** 192n)) + 1n;
+    const strip0x = (h) => (h || "").toLowerCase().replace(/^0x/, "");
+    const padHex64 = (h) => "0x" + strip0x(h).padStart(64, "0");
+    const toFeltHex = (hex) => {
+      let n = BigInt("0x" + strip0x(hex));
+      n = ((n % FIELD_P) + FIELD_P) % FIELD_P;
+      return "0x" + n.toString(16);
     };
-  };
-
-  function buildTypedData(alias_key_hex, len, user_hex, nonce, chainId_hex) {
-  const cleanHex = (h) => {
-    const s = strip0x(h);
-    return "0x" + (s.replace(/^0+/, "") || "0");
-  };
-
-  const data = {
-    types: {
-      StarkNetDomain: [
-        { name: "name", type: "felt" },
-        { name: "version", type: "felt" },
-        { name: "chainId", type: "felt" },
-      ],
-      RegisterAlias: [
-        { name: "user_addr", type: "felt" },
-        { name: "alias_key", type: "felt" },
-        { name: "len", type: "felt" },
-        { name: "nonce", type: "felt" },
-      ],
-    },
-    primaryType: "RegisterAlias",
-    domain: {
-      name: "AliasCBU",
-      version: "1",
-      chainId: cleanHex(chainId_hex),
-    },
-    message: {
-      user_addr: toFeltHex(user_hex),        // opcional: ya suele ser < P, pero no molesta
-      alias_key: toFeltHex(alias_key_hex),   // ← CRÍTICO: reducir keccak a felt
-      len: String(len),
-      nonce: String(nonce),
-    },
-  };
-
-  return data;
-}
-
-
-  let account, userAddr, prepared, cfg;
-
-  function enableButtons(p, a, s, su) {
-    $("btn-prepare").disabled = !p;
-    $("btn-approve").disabled = !a;
-    $("btn-sign").disabled = !s;
-    $("btn-submit").disabled = !su;
-  }
-
-function waitForWallets(ms = 1500) {
-  return new Promise((resolve) => {
-    let done = false;
-    const kick = () => {
-      if (done) return; done = true;
-
-      // Proveedores posibles
-      const sn = window.starknet;
-      const argentx = (sn && sn.isArgentX) ? sn : (window.starknet_argentX || null);
-      const braavos = (sn && sn.isBraavos) ? sn : (window.starknet_braavos || window.braavos || null);
-
-      resolve({ braavos, argentx });
+    const toUint256 = (value) => {
+      const bn = BigInt(value);
+      return {
+        low: "0x" + (bn & ((1n << 128n) - 1n)).toString(16),
+        high: "0x" + (bn >> 128n).toString(16)
+      };
     };
 
-    // 1) si ya están
-    if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) {
-      return kick();
+    // typed data builder (compatible con tu backend)
+    function buildTypedData(alias_key_hex, len, user_hex, nonce, chainId_hex) {
+      const cleanHex = (h) => {
+        const s = strip0x(h);
+        return "0x" + (s.replace(/^0+/, "") || "0");
+      };
+
+      return {
+        types: {
+          StarkNetDomain: [
+            { name: "name", type: "felt" },
+            { name: "version", type: "felt" },
+            { name: "chainId", type: "felt" },
+          ],
+          RegisterAlias: [
+            { name: "user_addr", type: "felt" },
+            { name: "alias_key", type: "felt" },
+            { name: "len", type: "felt" },
+            { name: "nonce", type: "felt" },
+          ],
+        },
+        primaryType: "RegisterAlias",
+        domain: {
+          name: "AliasCBU",
+          version: "1",
+          chainId: cleanHex(chainId_hex),
+        },
+        message: {
+          user_addr: toFeltHex(user_hex),
+          alias_key: toFeltHex(alias_key_hex),
+          len: String(len),
+          nonce: String(nonce),
+        },
+      };
     }
-    // 2) evento estándar
-    window.addEventListener('starknet#initialized', () => setTimeout(kick, 0), { once: true });
-    // 3) timeout
-    setTimeout(kick, ms);
-  });
-}
 
-async function connectDirect() {
-  const { braavos, argentx } = await waitForWallets(1500);
+    // Wait for wallet injection (manual connect flow uses this)
+    function waitForWallets(ms = 8000) {
+      return new Promise((resolve) => {
+        const start = Date.now();
 
-  const candidates = [
-    { name: 'ArgentX', obj: argentx },
-    { name: 'Braavos', obj: braavos },
-    { name: 'Braavos (legacy)', obj: window.braavos },
-  ];
+        function kick() {
+          const sn = window.starknet || null;
+          const argentx = (sn && sn.isArgentX) ? sn : (window.starknet_argentX || null);
+          const braavos = (sn && sn.isBraavos) ? sn : (window.starknet_braavos || window.braavos || null);
 
-  for (const { name, obj } of candidates) {
-    if (!obj) continue;
-    try {
-      // Algunos exigen enable() con versión
-      if (typeof obj.enable === 'function') {
-        await obj.enable({ starknetVersion: 'v5' });
-      } else if (obj.request) {
-        // fallback genérico
-        await obj.request({ type: 'wallet_requestAccounts' });
-      }
+          resolve({ braavos, argentx });
+        }
 
-      const acc = obj.account || obj.selectedAccount || obj;
-      if (acc?.address) {
-        return { account: acc, address: acc.address, name };
-      }
-    } catch (e) {
-      console.warn(`${name} falló:`, e?.message || e);
-    }
-  }
+        // if already present
+        if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) {
+          return kick();
+        }
 
-  throw new Error("No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
-}
+        // listen for standard event
+        window.addEventListener('starknet#initialized', () => kick(), { once: true });
 
-  $("btn-connect").onclick = async () => {
-    try {
-      log("Conectando...");
-      const conn = await connectDirect();
-      
-      account = conn.account;
-      userAddr = padHex64(conn.address);
-      $("acc").textContent = `${userAddr.slice(0,10)}...${userAddr.slice(-8)} (${conn.name})`;
-
-      const res = await fetch("/api/config");
-      if (!res.ok) throw new Error(await res.text());
-      cfg = await res.json();
-
-      cfg.aic_token = padHex64(cfg.aic_token);
-      cfg.relayer_address = padHex64(cfg.relayer_address);
-      cfg.chain_id = "0x" + strip0x(cfg.chain_id).replace(/^0+/, '');
-
-      log(`Conectado: ${conn.name}\nChainId: ${cfg.chain_id}`, 'ok');
-      enableButtons(true, false, false, false);
-    } catch (e) {
-      log(`Error: ${e.message}\n\nProbá:\n• Recargar (Ctrl+Shift+R)\n• Usar Firefox\n• Actualizar extensión`, 'err');
-    }
-  };
-
-  $("btn-reset").onclick = () => {
-    account = userAddr = prepared = cfg = null;
-    $("acc").textContent = "";
-    $("prep").textContent = "";
-    enableButtons(false, false, false, false);
-    log("Reset OK");
-  };
-
-  $("btn-prepare").onclick = async () => {
-    if (!userAddr) { alert("Conectá wallet"); return; }
-    const alias = $("alias").value.trim();
-    
-    try {
-      const res = await fetch("/api/prepare", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_address: userAddr, alias })
+        // fallback timeout
+        setTimeout(kick, ms);
       });
-      
-      if (!res.ok) throw new Error(await res.text());
-      prepared = await res.json();
-      
-      $("prep").textContent = `✓ Alias: ${alias}\n  Key: ${prepared.alias_key}\n  Fee: ${prepared.fee_aic_wei} wei`;
-      log("Preparado OK. Ahora hacé approve.", 'ok');
-      enableButtons(true, true, false, false);
-    } catch (e) {
-      log("Error: " + e.message, 'err');
     }
-  };
 
-  const V1 = (typeof TransactionVersion !== 'undefined' && TransactionVersion.V1) ? TransactionVersion.V1 : '0x1';
-  const V3 = (typeof TransactionVersion !== 'undefined' && TransactionVersion.V3) ? TransactionVersion.V3 : '0x3';
-  
-  async function postJson(url, body) {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // Attempt to connect by trying known providers
+    async function connectDirect() {
+      const { braavos, argentx } = await waitForWallets(8000);
 
-    const text = await r.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { }
+      const candidates = [
+        { name: 'ArgentX', obj: argentx },
+        { name: 'Braavos', obj: braavos },
+        { name: 'Braavos (legacy)', obj: window.braavos }
+      ];
 
-    if (!r.ok) {
-      const msg = data?.detail || data?.error || text || `HTTP ${r.status}`;
-      throw new Error(msg);
+      for (const { name, obj } of candidates) {
+        if (!obj) continue;
+        try {
+          if (typeof obj.enable === 'function') {
+            await obj.enable({ starknetVersion: 'v5' });
+          } else if (obj.request) {
+            // some wallets expose other request shapes
+            await obj.request({ type: 'wallet_requestAccounts' });
+          }
+
+          const acc = obj.account || obj.selectedAccount || obj;
+          if (acc?.address) {
+            return { account: acc, address: acc.address, name };
+          }
+
+          // fallback: some wallets set selectedAddress
+          if (obj.selectedAddress) return { account: obj, address: obj.selectedAddress, name };
+        } catch (e) {
+          console.warn(`${name} falló:`, e?.message || e);
+        }
+      }
+
+      throw new Error("No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
     }
-    return data ?? {};
-  }
 
-$("btn-approve").onclick = async () => {
-  if (!prepared || !account) { alert("Falta preparar"); return; }
-  try {
-    const amount = toUint256(prepared.fee_aic_wei);
-    const approveCall = {
-      contractAddress: cfg.aic_token,
-      entrypoint: "approve",
-      calldata: [ cfg.relayer_address, amount.low, amount.high ]
+    // DOM wiring & logic
+    let account = null, userAddr = null, prepared = null, cfg = null;
+
+    function enableButtons(p, a, s, su) {
+      $("btn-prepare").disabled = !p;
+      $("btn-approve").disabled = !a;
+      $("btn-sign").disabled = !s;
+      $("btn-submit").disabled = !su;
+    }
+
+    async function getJSON(url) {
+      const r = await fetch(url);
+      const t = await r.text();
+      let d = null;
+      try { d = t ? JSON.parse(t) : null; } catch {}
+      if (!r.ok) throw new Error(d?.detail || d?.error || t || `HTTP ${r.status}`);
+      return d ?? {};
+    }
+
+    // BUTTON: Connect
+    $("btn-connect").onclick = async () => {
+      try {
+        log("Conectando wallet...");
+        const conn = await connectDirect();
+        account = conn.account;
+        userAddr = padHex64(conn.address);
+        $("acc").textContent = `${userAddr.slice(0,10)}...${userAddr.slice(-8)} (${conn.name})`;
+
+        if (!API_BASE) {
+          log("Conectado, pero API_BASE no configurado. Para usar prepare/submit necesitás un backend.", "warn");
+          okEl && (okEl.textContent = `Conectado: ${shortHex(userAddr)} (${conn.name}). Backend no configurado.`);
+          // Enable only prepare if you want to allow local-only flows; here we require backend
+          enableButtons(false, false, false, false);
+          return;
+        }
+
+        // fetch config from backend
+        log("Obteniendo configuración desde backend...", "info");
+        const res = await fetch(`${API_BASE}/api/config`);
+        if (!res.ok) throw new Error(await res.text());
+        cfg = await res.json();
+
+        cfg.aic_token = padHex64(cfg.aic_token);
+        cfg.relayer_address = padHex64(cfg.relayer_address);
+        cfg.chain_id = "0x" + strip0x(cfg.chain_id).replace(/^0+/, '');
+        log(`Conectado: ${conn.name}\nChainId: ${cfg.chain_id}`, 'ok');
+        okEl && (okEl.textContent = `Conectado: ${shortHex(userAddr)} (${conn.name})`);
+        enableButtons(true, false, false, false);
+      } catch (e) {
+        log(`Error: ${e.message}\n\nProbá:\n• Recargar (Ctrl+Shift+R)\n• Usar Firefox\n• Actualizar extensión`, 'err');
+        showError(e.message, true);
+      }
     };
 
-    // v3 + STRK con maxFee fijo (podés reemplazar por el estimate_v3 cuando lo tengas estable)
-    const SAFE_MAX_FEE = "0x1DCD65000"; // ajustá si te dice "max fee too low"
-    const res = await account.execute([approveCall], undefined, {
-      version: "0x3",
-      maxFee: SAFE_MAX_FEE
-    });
-
-    const txHash = res.transaction_hash || res;
-    log(`Approve enviado (v3 STRK)!\nTx: ${txHash}\nAhora firmá el mensaje.`, "ok");
-    enableButtons(true, true, true, false);
-  } catch (e) {
-    log(`Error approve: ${e.message || e}`, "err");
-  }
-};
-
-
-async function signTypedMessageWithFallback(account, typed) {
-  // 1) intento estándar
-  try {
-    let sig = await account.signMessage(typed);
-    if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
-    return sig;
-  } catch (e) {
-    console.warn("signMessage estándar falló, probando Braavos.request:", e);
-  }
-
-  // 2) Braavos nativo
-  const br = window.starknet_braavos || window.braavos;
-  if (br?.request) {
-    let sig = await br.request({
-      type: "braavos_signMessage",
-      params: typed, // mismo objeto typed data Cairo
-    });
-    if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
-    return sig;
-  }
-
-  throw new Error("No se pudo firmar el mensaje (Braavos no disponible).");
-}
-
-
-  $("btn-sign").onclick = async () => {
-  if (!prepared || !account) { alert("Falta preparar"); return; }
-  try {
-    const typed = buildTypedData(
-      prepared.alias_key,
-      prepared.len,
-      userAddr,
-      prepared.nonce,
-      cfg.chain_id   // ojo: sin padding extra
-    );
-    const sig = await signTypedMessageWithFallback(account, typed);
-    prepared.signature = sig;
-    log(`Firma OK\nR: ${sig[0]}\nS: ${sig[1]}`, "ok");
-    enableButtons(true, true, true, true);
-  } catch (e) {
-    log(`Error firmando: ${e.message || e}`, "err");
-    enableButtons(true, true, true, false);
-  }
-};
-
-
-  $("btn-submit").onclick = async () => {
-    if (!prepared?.signature) { alert("Falta firmar"); return; }
-    
-    try {
-      log("Enviando al relayer...", 'info');
-      
-      const res = await fetch("/api/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_address: userAddr,
-          alias: $("alias").value.trim(),
-          signature: prepared.signature,
-          nonce: prepared.nonce
-        })
-      });
-      
-      if (!res.ok) throw new Error(await res.text());
-      const out = await res.json();
-      
-      log(`✅ REGISTRO EXITOSO!\n\nTx: ${out.tx_hash}\nRelayer: ${out.relayer}\n\nPodés ver la tx en Starkscan/Voyager`, 'ok');
-      
-      prepared = null;
+    // BUTTON: Reset
+    $("btn-reset").onclick = () => {
+      account = userAddr = prepared = cfg = null;
+      $("acc").textContent = "";
       $("prep").textContent = "";
-      $("alias").value = "";
-      enableButtons(true, false, false, false);
-    } catch (e) {
-      log(`Error: ${e.message}`, 'err');
+      enableButtons(false, false, false, false);
+      $("resolve-out").textContent = "";
+      $("out").innerHTML = "";
+      okEl && (okEl.textContent = "");
+      errEl && (errEl.textContent = "");
+      log("Reset OK");
+    };
+
+    // BUTTON: Prepare
+    $("btn-prepare").onclick = async () => {
+      if (!userAddr) { alert("Conectá wallet"); return; }
+      const alias = $("alias").value.trim();
+      if (!alias) { alert("Ingresá un alias"); return; }
+      if (!API_BASE) { showError("Backend no configurado (API_BASE vacío). No puedo preparar.", true); return; }
+
+      try {
+        const res = await fetch(`${API_BASE}/api/prepare`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_address: userAddr, alias })
+        });
+        if (!res.ok) throw new Error(await res.text());
+        prepared = await res.json();
+        $("prep").textContent = `✓ Alias: ${alias}\n  Key: ${prepared.alias_key}\n  Fee: ${prepared.fee_aic_wei} wei`;
+        log("Preparado OK. Ahora hacé approve.", 'ok');
+        enableButtons(true, true, false, false);
+      } catch (e) {
+        log("Error: " + (e.message || e), 'err');
+      }
+    };
+
+    // BUTTON: Approve (ERC20 approve to relayer)
+    $("btn-approve").onclick = async () => {
+      if (!prepared || !account) { alert("Falta preparar"); return; }
+      try {
+        const amount = toUint256(prepared.fee_aic_wei);
+        const approveCall = {
+          contractAddress: cfg.aic_token,
+          entrypoint: "approve",
+          calldata: [ cfg.relayer_address, amount.low, amount.high ]
+        };
+
+        const SAFE_MAX_FEE = "0x1DCD65000";
+        const res = await account.execute([approveCall], undefined, {
+          version: "0x3",
+          maxFee: SAFE_MAX_FEE
+        });
+
+        const txHash = res.transaction_hash || res;
+        log(`Approve enviado (v3 STRK)!\nTx: ${txHash}\nAhora firmá el mensaje.`, "ok");
+        enableButtons(true, true, true, false);
+      } catch (e) {
+        log(`Error approve: ${e.message || e}`, "err");
+      }
+    };
+
+    // Sign message with fallbacks
+    async function signTypedMessageWithFallback(accountObj, typed) {
+      try {
+        let sig = await accountObj.signMessage(typed);
+        if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
+        return sig;
+      } catch (e) {
+        console.warn("signMessage estándar falló, probando Braavos.request:", e);
+      }
+
+      const br = window.starknet_braavos || window.braavos;
+      if (br?.request) {
+        let sig = await br.request({
+          type: "braavos_signMessage",
+          params: typed,
+        });
+        if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
+        return sig;
+      }
+
+      throw new Error("No se pudo firmar el mensaje (Braavos/ArgentX no disponible para firmar).");
     }
-  };
-  async function getJSON(url) {
-  const r = await fetch(url);
-  const t = await r.text();
-  let d = null;
-  try { d = t ? JSON.parse(t) : null; } catch {}
-  if (!r.ok) throw new Error(d?.detail || d?.error || t || `HTTP ${r.status}`);
-  return d ?? {};
-}
 
-$("btn-resolve-alias").onclick = async () => {
-  const alias = $("q-alias").value.trim();
-  if (!alias) { alert("Ingresá un alias"); return; }
-  try {
-    const r = await getJSON(`/api/resolve_alias?alias=${encodeURIComponent(alias)}`);
-    $("resolve-out").textContent = JSON.stringify(r, null, 2);
-  } catch (e) {
-    $("resolve-out").textContent = "Error: " + (e.message || e);
-  }
-};
+    // BUTTON: Sign
+    $("btn-sign").onclick = async () => {
+      if (!prepared || !account) { alert("Falta preparar"); return; }
+      try {
+        const typed = buildTypedData(
+          prepared.alias_key,
+          prepared.len,
+          userAddr,
+          prepared.nonce,
+          cfg.chain_id
+        );
+        const sig = await signTypedMessageWithFallback(account, typed);
+        prepared.signature = sig;
+        log(`Firma OK\nR: ${sig[0]}\nS: ${sig[1]}`, "ok");
+        enableButtons(true, true, true, true);
+      } catch (e) {
+        log(`Error firmando: ${e.message || e}`, "err");
+        enableButtons(true, true, true, false);
+      }
+    };
 
-$("btn-resolve-addr").onclick = async () => {
-  const addr = $("q-addr").value.trim();
-  if (!addr) { alert("Ingresá un address 0x"); return; }
-  try {
-    const r = await getJSON(`/api/resolve_address?address=${encodeURIComponent(addr)}`);
-    $("resolve-out").textContent = JSON.stringify(r, null, 2);
-  } catch (e) {
-    $("resolve-out").textContent = "Error: " + (e.message || e);
-  }
-};
+    // BUTTON: Submit
+    $("btn-submit").onclick = async () => {
+      if (!prepared?.signature) { alert("Falta firmar"); return; }
+      if (!API_BASE) { showError("Backend no configurado (API_BASE vacío). No puedo enviar.", true); return; }
 
-$("btn-list").onclick = async () => {
-  try {
-    const r = await getJSON("/list");
-    $("resolve-out").textContent = JSON.stringify(r, null, 2);
-  } catch (e) {
-    $("resolve-out").textContent = "Error: " + (e.message || e);
-  }
-};
+      try {
+        log("Enviando al relayer...", 'info');
 
-</script>
+        const res = await fetch(`${API_BASE}/api/submit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_address: userAddr,
+            alias: $("alias").value.trim(),
+            signature: prepared.signature,
+            nonce: prepared.nonce
+          })
+        });
+
+        if (!res.ok) throw new Error(await res.text());
+        const out = await res.json();
+
+        log(`✅ REGISTRO EXITOSO!\n\nTx: ${out.tx_hash}\nRelayer: ${out.relayer}\n\nPodés ver la tx en Starkscan/Voyager`, 'ok');
+
+        prepared = null;
+        $("prep").textContent = "";
+        $("alias").value = "";
+        enableButtons(true, false, false, false);
+      } catch (e) {
+        log(`Error: ${e.message}`, 'err');
+      }
+    };
+
+    // Resolve helper buttons (use API_BASE)
+    $("btn-resolve-alias").onclick = async () => {
+      const alias = $("q-alias").value.trim();
+      if (!alias) { alert("Ingresá un alias"); return; }
+      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
+      try {
+        const r = await getJSON(`${API_BASE}/api/resolve_alias?alias=${encodeURIComponent(alias)}`);
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    $("btn-resolve-addr").onclick = async () => {
+      const addr = $("q-addr").value.trim();
+      if (!addr) { alert("Ingresá un address 0x"); return; }
+      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
+      try {
+        const r = await getJSON(`${API_BASE}/api/resolve_address?address=${encodeURIComponent(addr)}`);
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    $("btn-list").onclick = async () => {
+      if (!API_BASE) { $("resolve-out").textContent = "Backend no configurado (API_BASE vacío)."; return; }
+      try {
+        const r = await getJSON(`${API_BASE}/list`);
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    // Initially disable buttons
+    enableButtons(false, false, false, false);
+  })();
+  </script>
 </body>
 </html>
