@@ -4,7 +4,7 @@
     { "src": "app.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/aliascbu\\.js", "dest": "/public/aliascbu.js" },
+    { "src": "/aliascbu\\.js", "dest": "public/aliascbu.js" },
     { "src": "/api/(.*)", "dest": "app.py" },
     { "src": "/(.*)", "dest": "app.py" }
   ]
