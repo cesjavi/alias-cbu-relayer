@@ -77,45 +77,73 @@
   </div>
   <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
 </div>
+
+<div id="wallet-ok"></div>
+<div id="wallet-error" style="color:#c00"></div>
+
 <script>
-(async () => {
+(function () {
+  const okEl = document.getElementById('wallet-ok');
+  const errEl = document.getElementById('wallet-error');
+
   function showError(msg) {
     console.error(msg);
-    const el = document.getElementById('wallet-error');
-    if (el) el.textContent = msg;
+    if (errEl) errEl.textContent = msg;
     alert(msg); // opcional
   }
 
-  // Intentar detectar las extensiones
-  const braavos = window.starknet_braavos;
-  const argentX = window.starknet_argentX;
+  // Esperar a que la wallet inyecte el objeto en window
+  function waitForWallet(timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
 
-  if (!braavos && !argentX) {
-    showError("❌ No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
-    return;
+      function check() {
+        const braavos = window.starknet_braavos;
+        const argentX = window.starknet_argentX;
+        const legacy = window.starknet; // algunas wallets exponen este alias
+
+        if (braavos || argentX || legacy) return resolve(braavos || argentX || legacy);
+        if (Date.now() - start > timeoutMs) return reject(new Error("wallet-timeout"));
+        setTimeout(check, 200);
+      }
+
+      // algunas wallets emiten este evento al inicializar
+      window.addEventListener('starknet#initialized', () => check(), { once: true });
+      check();
+    });
   }
 
-  const wallet = braavos || argentX;
+  async function connect() {
+    try {
+      const wallet = await waitForWallet();
 
-  try {
-    // Algunas extensiones usan enable(), otras request()
-    if (wallet.enable) {
-      await wallet.enable({ starknetVersion: "v5" });
-    } else if (wallet.request) {
-      await wallet.request({ type: "starknet_enable", params: { starknetVersion: "v5" } });
+      // distintos métodos según wallet/versión
+      if (wallet.enable) {
+        await wallet.enable({ starknetVersion: "v5" });
+      } else if (wallet.request) {
+        await wallet.request({ type: "starknet_enable", params: { starknetVersion: "v5" } });
+      }
+
+      const addr = wallet.selectedAddress || (wallet.account && wallet.account.address);
+      if (!addr) throw new Error("no-address");
+      if (okEl) okEl.textContent = "Conectado: " + addr;
+    } catch (e) {
+      if (e && e.message === "wallet-timeout") {
+        showError("❌ No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
+      } else {
+        showError("❌ Error al conectar la wallet. Ver permisos del sitio en la extensión.");
+      }
     }
+  }
 
-    const addr = wallet.selectedAddress || (wallet.account && wallet.account.address);
-    console.log("✅ Wallet conectada:", addr);
-    const okEl = document.getElementById('wallet-ok');
-    if (okEl) okEl.textContent = "Conectado: " + addr;
-  } catch (e) {
-    console.error(e);
-    showError("❌ Error al conectar la wallet. Probá recargar o revisar permisos del sitio en la extensión.");
+  // Ejecutar cuando el DOM esté listo
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", connect);
+  } else {
+    connect();
   }
 })();
 </script>
-
 <script >
   const $ = (id) => document.getElementById(id);
   
