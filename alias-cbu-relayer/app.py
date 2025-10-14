@@ -572,7 +572,7 @@ async def resolve_address(address: str):
         "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None,
     }
 
-@app.get("/list")
+@app.get("/api/list")
 async def list_local():
     items = [{"alias": alias, "alias_key": k, "address": addr} for k, (addr, alias) in ALIAS_INDEX.items()]
     items.sort(key=lambda x: x["alias"])
