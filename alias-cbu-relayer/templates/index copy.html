@@ -150,7 +150,7 @@ const toFeltHex = (hex) => {
 }
 
 
-  let account, userAddr, prepared, cfg;
+  let account, userAddr, prepared, cfg, walletName;
 
   function enableButtons(p, a, s, su) {
     $("btn-prepare").disabled = !p;
@@ -158,6 +158,40 @@ const toFeltHex = (hex) => {
     $("btn-sign").disabled = !s;
     $("btn-submit").disabled = !su;
   }
+
+function detectXverse() {
+  const guesses = [];
+  if (window.starknet_xverse) guesses.push(window.starknet_xverse);
+  const providers = window.xverseProviders;
+  if (providers?.starknet) guesses.push(providers.starknet);
+  if (window.xverse) {
+    if (window.xverse.starknet) guesses.push(window.xverse.starknet);
+    if (window.xverse.starknetProvider) guesses.push(window.xverse.starknetProvider);
+  }
+  if (window.xverseProvider) guesses.push(window.xverseProvider);
+  if (window.xverseWallet?.starknet) guesses.push(window.xverseWallet.starknet);
+  if (window.btc?.starknet) guesses.push(window.btc.starknet);
+  for (const guess of guesses) {
+    if (!guess) continue;
+    if (typeof guess === "function") {
+      try {
+        const maybe = guess();
+        if (maybe) return maybe;
+      } catch (e) {}
+    }
+    if (typeof guess.getProvider === "function") {
+      try {
+        const provider = guess.getProvider();
+        if (provider) return provider;
+      } catch (e) {}
+    }
+    if (guess?.provider) return guess.provider;
+    if (guess?.request || guess?.enable || guess?.account || guess?.selectedAddress || guess?.selectedAccount) {
+      return guess;
+    }
+  }
+  return null;
+}
 
 function waitForWallets(ms = 1500) {
   return new Promise((resolve) => {
@@ -170,26 +204,31 @@ function waitForWallets(ms = 1500) {
       const argentx = (sn && sn.isArgentX) ? sn : (window.starknet_argentX || null);
       const braavos = (sn && sn.isBraavos) ? sn : (window.starknet_braavos || window.braavos || null);
 
-      resolve({ braavos, argentx });
+      const xverse = detectXverse();
+
+      resolve({ braavos, argentx, xverse });
     };
 
     // 1) si ya están
-    if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) {
+    if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX || window.starknet_xverse || window.xverseProviders || window.xverse || window.xverseProvider || window.xverseWallet) {
       return kick();
     }
     // 2) evento estándar
-    window.addEventListener('starknet#initialized', () => setTimeout(kick, 0), { once: true });
+    const handler = () => setTimeout(kick, 0);
+    window.addEventListener('starknet#initialized', handler, { once: true });
+    window.addEventListener('xverse#initialized', handler, { once: true });
     // 3) timeout
     setTimeout(kick, ms);
   });
 }
 
 async function connectDirect() {
-  const { braavos, argentx } = await waitForWallets(1500);
+  const { braavos, argentx, xverse } = await waitForWallets(1500);
 
   const candidates = [
     { name: 'ArgentX', obj: argentx },
     { name: 'Braavos', obj: braavos },
+    { name: 'Xverse', obj: xverse },
     { name: 'Braavos (legacy)', obj: window.braavos },
   ];
 
@@ -213,16 +252,17 @@ async function connectDirect() {
     }
   }
 
-  throw new Error("No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
+  throw new Error("No se encontró ArgentX, Braavos ni Xverse. Revisá 'Site access' en la extensión y recargá.");
 }
 
   $("btn-connect").onclick = async () => {
     try {
       log("Conectando...");
       const conn = await connectDirect();
-      
+
       account = conn.account;
       userAddr = padHex64(conn.address);
+      walletName = conn.name;
       $("acc").textContent = `${userAddr.slice(0,10)}...${userAddr.slice(-8)} (${conn.name})`;
 
       const res = await fetch("/api/config");
@@ -242,6 +282,7 @@ async function connectDirect() {
 
   $("btn-reset").onclick = () => {
     account = userAddr = prepared = cfg = null;
+    walletName = null;
     $("acc").textContent = "";
     $("prep").textContent = "";
     enableButtons(false, false, false, false);
@@ -324,10 +365,32 @@ async function signTypedMessageWithFallback(account, typed) {
     if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
     return sig;
   } catch (e) {
-    console.warn("signMessage estándar falló, probando Braavos.request:", e);
+    console.warn("signMessage estándar falló, probando request directa:", e);
   }
 
-  // 2) Braavos nativo
+  // 2) Xverse via request (si aplica)
+  if (walletName === 'Xverse') {
+    const xverse = detectXverse();
+    if (xverse?.request) {
+      const payloads = [
+        { type: "wallet_signTypedData", params: typed },
+        { type: "wallet_signTypedData", params: [typed] },
+        { type: "wallet_signMessage", params: typed },
+        { type: "wallet_signMessage", params: [typed] },
+      ];
+      for (const payload of payloads) {
+        try {
+          let sig = await xverse.request(payload);
+          if (sig?.result) sig = sig.result;
+          if (!sig) continue;
+          if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
+          if (Array.isArray(sig)) return sig;
+        } catch (_) {}
+      }
+    }
+  }
+
+  // 3) Braavos nativo
   const br = window.starknet_braavos || window.braavos;
   if (br?.request) {
     let sig = await br.request({
@@ -338,7 +401,7 @@ async function signTypedMessageWithFallback(account, typed) {
     return sig;
   }
 
-  throw new Error("No se pudo firmar el mensaje (Braavos no disponible).");
+  throw new Error("No se pudo firmar el mensaje (wallet no respondió).");
 }
 
 
