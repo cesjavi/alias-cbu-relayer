@@ -392,7 +392,11 @@ async def submit(data: SubmitIn):
 
     client, relayer = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import (
+            Call,
+            ResourceBounds,
+            ResourceBoundsMapping,
+        )
         from starknet_py.hash.selector import get_selector_from_name
         try:
             from starknet_py.net.client_models import BlockId, Tag
@@ -414,6 +418,7 @@ async def submit(data: SubmitIn):
     )
 
     SAFE_FEE = int(5e17)
+    estimated_bounds: Optional[ResourceBoundsMapping] = None
     try:
         if hasattr(relayer, "_estimate_fee"):
             est = await relayer._estimate_fee(
@@ -423,10 +428,21 @@ async def submit(data: SubmitIn):
                 nonce=None,
             )
             fee_value = int(est.overall_fee * 13 // 10)
+            try:
+                estimated_bounds = est.to_resource_bounds(
+                    amount_multiplier=1.3,
+                    unit_price_multiplier=1.3,
+                )
+            except Exception as conv_err:
+                print("[warn] no se pudo convertir fee estimate a resource_bounds:", conv_err)
+                estimated_bounds = None
         else:
             raise Exception("_estimate_fee no disponible")
     except Exception as e:
         print("[warn] estimate failed, usando fee fijo:", e)
+        fee_value = SAFE_FEE
+
+    if fee_value <= 0:
         fee_value = SAFE_FEE
 
     calls = [erc20_transfer_from, alias_register]
@@ -449,14 +465,35 @@ async def submit(data: SubmitIn):
     attempts.append(primary_kwargs)
 
     fallback_kwargs = {"calls": calls}
-    if "auto_estimate" in params:
-        fallback_kwargs["auto_estimate"] = False
+    manual_fee_fields = False
+
+    if "resource_bounds" in params and estimated_bounds is not None:
+        fallback_kwargs["resource_bounds"] = ResourceBoundsMapping(
+            l1_gas=ResourceBounds(
+                max_amount=estimated_bounds.l1_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l1_gas.max_price_per_unit,
+            ),
+            l1_data_gas=ResourceBounds(
+                max_amount=estimated_bounds.l1_data_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l1_data_gas.max_price_per_unit,
+            ),
+            l2_gas=ResourceBounds(
+                max_amount=estimated_bounds.l2_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l2_gas.max_price_per_unit,
+            ),
+        )
+        manual_fee_fields = True
+
     if "max_fee" in params:
         fallback_kwargs["max_fee"] = fee_value
+        manual_fee_fields = True
     elif "fee" in params:
         fallback_kwargs["fee"] = fee_value
+        manual_fee_fields = True
 
-    if fallback_kwargs != primary_kwargs:
+    if manual_fee_fields:
+        if "auto_estimate" in params:
+            fallback_kwargs["auto_estimate"] = False
         attempts.append(fallback_kwargs)
 
     for kwargs in attempts:
