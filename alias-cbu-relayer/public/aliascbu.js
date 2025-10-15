@@ -56,29 +56,68 @@
   }
 
   // ---------- Wallet detection ----------
+  function detectXverse() {
+    if (typeof window === "undefined") return null;
+    const guesses = [];
+    if (window.starknet_xverse) guesses.push(window.starknet_xverse);
+    const providers = window.xverseProviders;
+    if (providers?.starknet) guesses.push(providers.starknet);
+    if (window.xverse) {
+      if (window.xverse.starknet) guesses.push(window.xverse.starknet);
+      if (window.xverse.starknetProvider) guesses.push(window.xverse.starknetProvider);
+    }
+    if (window.xverseProvider) guesses.push(window.xverseProvider);
+    if (window.xverseWallet?.starknet) guesses.push(window.xverseWallet.starknet);
+    if (window.btc?.starknet) guesses.push(window.btc.starknet);
+    for (const guess of guesses) {
+      if (!guess) continue;
+      if (typeof guess === "function") {
+        try {
+          const maybe = guess();
+          if (maybe) return maybe;
+        } catch (_) {}
+      }
+      if (typeof guess.getProvider === "function") {
+        try {
+          const provider = guess.getProvider();
+          if (provider) return provider;
+        } catch (_) {}
+      }
+      if (guess?.provider) return guess.provider;
+      if (guess?.request || guess?.enable || guess?.account || guess?.selectedAddress || guess?.selectedAccount) {
+        return guess;
+      }
+    }
+    return null;
+  }
+
   function waitForWallets(ms = 8000) {
     return new Promise((resolve) => {
       const kick = () => {
         const sn = (typeof window !== "undefined") ? window.starknet : null;
         const argentx = (sn && sn.isArgentX) ? sn : ((typeof window !== "undefined") ? window.starknet_argentX : null);
         const braavos = (sn && sn.isBraavos) ? sn : ((typeof window !== "undefined") ? (window.starknet_braavos || window.braavos) : null);
-        resolve({ braavos, argentx });
+        const xverse = detectXverse();
+        resolve({ braavos, argentx, xverse });
       };
-      if (typeof window !== "undefined" && (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX)) {
+      if (typeof window !== "undefined" && (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX || window.starknet_xverse || window.xverseProviders || window.xverse || window.xverseProvider || window.xverseWallet)) {
         return kick();
       }
       if (typeof window !== "undefined") {
-        window.addEventListener('starknet#initialized', () => kick(), { once: true });
+        const handler = () => kick();
+        window.addEventListener('starknet#initialized', handler, { once: true });
+        window.addEventListener('xverse#initialized', handler, { once: true });
       }
       setTimeout(kick, ms);
     });
   }
 
   async function connect() {
-    const { braavos, argentx } = await waitForWallets(8000);
+    const { braavos, argentx, xverse } = await waitForWallets(8000);
     const candidates = [
       { name: 'ArgentX', obj: argentx },
       { name: 'Braavos', obj: braavos },
+      { name: 'Xverse', obj: xverse },
       { name: 'Braavos (legacy)', obj: (typeof window !== "undefined") ? window.braavos : null },
     ];
     for (const { name, obj } of candidates) {
@@ -101,7 +140,7 @@
         // probar la siguiente
       }
     }
-    throw new Error("No se encontró Braavos ni ArgentX. Verificá permisos del sitio o la instalación.");
+    throw new Error("No se encontró ArgentX, Braavos ni Xverse. Verificá permisos del sitio o la instalación.");
   }
 
   async function loadConfig() {
@@ -153,6 +192,29 @@
         if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
         return sig;
       } catch (e) { /* sigue fallback */ }
+    }
+    // Intento genérico vía request (p.ej. Xverse expone el provider directamente)
+    if (state.walletName === 'Xverse') {
+      const xverse = detectXverse();
+      if (xverse?.request) {
+        const payloads = [
+          { type: "wallet_signTypedData", params: typed },
+          { type: "wallet_signTypedData", params: [typed] },
+          { type: "wallet_signMessage", params: typed },
+          { type: "wallet_signMessage", params: [typed] },
+        ];
+        for (const payload of payloads) {
+          try {
+            let sig = await xverse.request(payload);
+            if (sig?.result) sig = sig.result;
+            if (!sig) continue;
+            if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
+            if (Array.isArray(sig)) return sig;
+          } catch (_) {
+            // probar siguiente forma
+          }
+        }
+      }
     }
     // Braavos nativo
     const br = (typeof window !== "undefined") ? (window.starknet_braavos || window.braavos) : null;
@@ -233,6 +295,18 @@
     return await httpJson(apiUrl(`/api/resolve_address?address=${q}`));
   }
 
+  async function listContractEvents(opts = {}) {
+    const params = new URLSearchParams();
+    const limit = opts.limit ?? opts.chunkSize ?? opts.chunk_size;
+    if (limit != null) params.set("limit", String(limit));
+    if (opts.continuationToken) params.set("continuation_token", opts.continuationToken);
+    if (opts.continuation_token) params.set("continuation_token", opts.continuation_token);
+    const maxChunks = opts.maxChunks ?? opts.max_chunks;
+    if (maxChunks != null) params.set("max_chunks", String(maxChunks));
+    const qs = params.toString();
+    return await httpJson(apiUrl(`/api/contract_events${qs ? `?${qs}` : ""}`));
+  }
+
   async function faucet(address) {
     const addr = address || state.address;
     if (!addr) throw new Error("Falta address (o conectá la wallet)");
@@ -257,6 +331,7 @@
       submit,
       resolveAlias,
       resolveAddress,
+      listContractEvents,
       faucet,
     };
   }

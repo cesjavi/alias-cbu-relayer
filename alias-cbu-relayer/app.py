@@ -604,6 +604,183 @@ async def resolve_address(address: str):
     }
 
 
+# ===== eventos on-chain =====
+
+
+@app.get("/api/contract_events")
+async def contract_events(
+    limit: int = 20,
+    continuation_token: Optional[str] = None,
+    max_chunks: int = 200,
+):
+    if not ALIAS_CONTRACT:
+        raise HTTPException(500, "ALIAS_CONTRACT no configurado")
+
+    client, _ = _get_client_and_relayer()
+
+    try:
+        from starknet_py.hash.selector import get_selector_from_name
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    try:
+        event_key = get_selector_from_name("AliasExternalUpdated")
+    except Exception as e:
+        raise HTTPException(500, f"No se pudo calcular selector: {e}")
+
+    chunk_size = max(1, min(int(limit or 20), 100))
+    max_scans = max(1, min(int(max_chunks or 1), 1000))
+
+    def _event_matches(evt) -> bool:
+        try:
+            keys_iter = list(getattr(evt, "keys", []) or [])
+        except Exception:
+            return False
+
+        for key in keys_iter:
+            try:
+                if int(key) == event_key:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _scan_events(keys_filter):
+        next_token_local = continuation_token
+        matched = []
+        fetches_local = 0
+        empty_local = 0
+        visited_local = set()
+        truncated_local = False
+
+        while len(matched) < chunk_size:
+            marker = next_token_local or "__initial__"
+            if marker in visited_local:
+                truncated_local = True
+                next_token_local = None
+                break
+            visited_local.add(marker)
+
+            try:
+                chunk = await client.get_events(
+                    address=ALIAS_CONTRACT,
+                    keys=keys_filter,
+                    from_block_number=0,
+                    to_block_number="latest",
+                    continuation_token=next_token_local,
+                    chunk_size=chunk_size,
+                )
+            except Exception as e:
+                raise HTTPException(500, f"Error consultando eventos: {e}")
+
+            fetches_local += 1
+            chunk_events = list(getattr(chunk, "events", []) or [])
+
+            matched_chunk = []
+            for evt in chunk_events:
+                if _event_matches(evt):
+                    matched.append(evt)
+                    matched_chunk.append(evt)
+                    if len(matched) >= chunk_size:
+                        break
+
+            if not matched_chunk:
+                empty_local += 1
+
+            next_token_local = getattr(chunk, "continuation_token", None)
+
+            if not next_token_local:
+                break
+
+            if fetches_local >= max_scans:
+                truncated_local = True
+                break
+
+        return {
+            "events": matched[:chunk_size],
+            "next_token": next_token_local,
+            "fetches": fetches_local,
+            "empty": empty_local,
+            "visited": visited_local,
+            "truncated": truncated_local,
+        }
+
+    primary_scan = await _scan_events([[event_key]])
+    used_fallback = False
+
+    if not primary_scan["events"] and primary_scan["fetches"] > 0:
+        fallback_scan = await _scan_events(None)
+        used_fallback = True
+
+        chosen_events = fallback_scan["events"]
+        next_token = fallback_scan["next_token"]
+        fetches = primary_scan["fetches"] + fallback_scan["fetches"]
+        empty_chunks = primary_scan["empty"] + fallback_scan["empty"]
+        visited_tokens = primary_scan["visited"].union(fallback_scan["visited"])
+        truncated = primary_scan["truncated"] or fallback_scan["truncated"]
+    else:
+        chosen_events = primary_scan["events"]
+        next_token = primary_scan["next_token"]
+        fetches = primary_scan["fetches"]
+        empty_chunks = primary_scan["empty"]
+        visited_tokens = primary_scan["visited"]
+        truncated = primary_scan["truncated"]
+
+    events = []
+    for evt in chosen_events:
+        data = list(getattr(evt, "data", []) or [])
+        alias_key_int = int(data[0]) if len(data) > 0 else 0
+        eth_int = int(data[1]) if len(data) > 1 else 0
+        btc_int = int(data[2]) if len(data) > 2 else 0
+
+        alias_key_hex = hex(alias_key_int) if alias_key_int else None
+        mem = ALIAS_INDEX.get(alias_key_hex) if alias_key_hex else None
+
+        events.append(
+            {
+                "block_number": getattr(evt, "block_number", None),
+                "block_hash": (
+                    hex(getattr(evt, "block_hash"))
+                    if getattr(evt, "block_hash", None) is not None
+                    else None
+                ),
+                "transaction_hash": (
+                    hex(getattr(evt, "transaction_hash"))
+                    if getattr(evt, "transaction_hash", None) is not None
+                    else None
+                ),
+                "from_address": (
+                    hex(getattr(evt, "from_address"))
+                    if getattr(evt, "from_address", None) is not None
+                    else None
+                ),
+                "alias_key": alias_key_hex,
+                "external": {
+                    "ETH": format_external_value(eth_int),
+                    "BTC": format_external_value(btc_int),
+                },
+                "raw_event": {
+                    "keys": [hex(k) for k in getattr(evt, "keys", []) or []],
+                    "data": [hex(v) for v in data],
+                },
+                "memory_index": dict(mem) if mem else None,
+            }
+        )
+
+    return {
+        "count": len(events),
+        "event_key": hex(event_key),
+        "continuation_token": next_token,
+        "events": events,
+        "chunk_size": chunk_size,
+        "fetches": fetches,
+        "empty_chunks": empty_chunks,
+        "scanned_chunks": len(visited_tokens),
+        "truncated": truncated,
+        "used_fallback_without_key": used_fallback,
+    }
+
+
 @app.get("/api/alias_of_external")
 async def alias_of_external(chain: str, external_address: str):
     chain_id = parse_chain_identifier(chain)
