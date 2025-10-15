@@ -217,6 +217,55 @@ def meta_message(
         f"eth:{hex(eth_address)}|btc:{hex(btc_address)}"
     )
 
+
+def _flatten_exception_message(exc: Exception) -> str:
+    """Concatena mensajes de excepciones anidadas en una sola línea legible."""
+
+    parts = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+
+    while current and id(current) not in seen:
+        seen.add(id(current))
+
+        text = getattr(current, "message", None)
+        if not text:
+            args = getattr(current, "args", None)
+            if args:
+                text = " ".join(str(arg) for arg in args if arg)
+        if not text:
+            text = str(current)
+
+        if text:
+            parts.append(str(text))
+
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    if not parts:
+        return "Error desconocido"
+
+    collapsed = " | ".join(parts)
+    collapsed = re.sub(r"\s+", " ", collapsed).strip()
+    return collapsed[:800] + ("…" if len(collapsed) > 800 else "")
+
+
+def _classify_relayer_error(exc: Exception) -> tuple[int, str]:
+    raw = _flatten_exception_message(exc)
+    upper = raw.upper()
+
+    if "ALIAS_TAKEN" in upper:
+        return 409, "Alias ya registrado on-chain (ALIAS_TAKEN)."
+    if "ETH_ADDR_IN_USE" in upper:
+        return 409, "La dirección ETH ya está asociada a otro alias (ETH_ADDR_IN_USE)."
+    if "BTC_ADDR_IN_USE" in upper:
+        return 409, "La dirección externa ya está asociada a otro alias (BTC_ADDR_IN_USE)."
+    if "INSUFFICIENT" in upper and "BALANCE" in upper:
+        return 400, "Fondos insuficientes o approve faltante para el token AIC."
+    if "TRANSFER_FROM" in upper and "FAILED" in upper:
+        return 400, "transfer_from del token AIC falló (approve/balance)."
+
+    return 500, f"Error enviando transacción: {raw}"
+
 # ==== modelos ====
 class PrepareIn(BaseModel):
     alias: str
@@ -381,34 +430,46 @@ async def submit(data: SubmitIn):
         fee_value = SAFE_FEE
 
     calls = [erc20_transfer_from, alias_register]
-    try:
-        import inspect
 
-        sig = inspect.signature(relayer.execute_v3)
-        kwargs = {"calls": calls}
+    resp = None
+    last_error: Optional[Exception] = None
 
-        if "auto_estimate" in sig.parameters:
-            kwargs["auto_estimate"] = True
-        elif "estimate_fee_mode" in sig.parameters:
-            kwargs["estimate_fee_mode"] = "auto"
-        else:
-            kwargs["auto_estimate"] = False
-            kwargs["max_fee"] = fee_value
+    import inspect
 
-        resp = await relayer.execute_v3(**kwargs)
-    except Exception:
+    sig = inspect.signature(relayer.execute_v3)
+    params = sig.parameters
+
+    attempts = []
+
+    primary_kwargs = {"calls": calls}
+    if "auto_estimate" in params:
+        primary_kwargs["auto_estimate"] = True
+    elif "estimate_fee_mode" in params:
+        primary_kwargs["estimate_fee_mode"] = "auto"
+    attempts.append(primary_kwargs)
+
+    fallback_kwargs = {"calls": calls}
+    if "auto_estimate" in params:
+        fallback_kwargs["auto_estimate"] = False
+    if "max_fee" in params:
+        fallback_kwargs["max_fee"] = fee_value
+    elif "fee" in params:
+        fallback_kwargs["fee"] = fee_value
+
+    if fallback_kwargs != primary_kwargs:
+        attempts.append(fallback_kwargs)
+
+    for kwargs in attempts:
         try:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                max_fee=fee_value,
-            )
-        except TypeError:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                fee=fee_value,
-            )
+            resp = await relayer.execute_v3(**kwargs)
+            break
+        except Exception as err:
+            last_error = err
+            resp = None
+
+    if resp is None:
+        status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
+        raise HTTPException(status_code, message)
 
     tx_hash = getattr(resp, "transaction_hash", resp)
 
