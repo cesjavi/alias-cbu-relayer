@@ -42,6 +42,17 @@
     <label for="alias">Alias (a-z 0-9 .) 4–20</label>
     <input id="alias" placeholder="mi.alias" style="width:100%; font-family: monospace;"/>
 
+    <div class="card" style="background:#f9fbff; margin-top:1rem;">
+      <strong>Direcciones externas (opcional)</strong>
+      <p class="muted" style="margin-top:.5rem;">
+        Se convierten a <code>felt</code>. Ingresá valores en hex <code>0x…</code> o texto ASCII (≤31 bytes).
+      </p>
+      <label for="eth-address" style="margin-top:.5rem;">ETH (0x…)</label>
+      <input id="eth-address" placeholder="0x1234…" style="width:100%; font-family: monospace;"/>
+      <label for="btc-address" style="margin-top:.5rem;">BTC / identificador</label>
+      <input id="btc-address" placeholder="btc1… / hash" style="width:100%; font-family: monospace;"/>
+    </div>
+
     <div class="row" style="margin-top: .5rem;">
       <button id="btn-prepare" disabled>1. Preparar</button>
       <button id="btn-approve" disabled>2. Approve AIC</button>
@@ -62,6 +73,14 @@
     <div class="row" style="margin-top:.5rem;">
       <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
       <button id="btn-resolve-addr">Address → Alias</button>
+    </div>
+    <div class="row" style="margin-top:.5rem;">
+      <select id="chain-select" style="flex:0 0 160px;">
+        <option value="ETH">ETH</option>
+        <option value="BTC">BTC</option>
+      </select>
+      <input id="external-address" placeholder="externo (0x… o ASCII)" style="flex:1; font-family:monospace;">
+      <button id="btn-resolve-external">Ext → Alias</button>
     </div>
     <div class="row" style="margin-top:.5rem;">
       <button id="btn-list">Listar (índice local del relayer)</button>
@@ -90,6 +109,10 @@
     const $ = id => document.getElementById(id);
     const okEl = $("wallet-ok");
     const errEl = $("wallet-error");
+    const ethInputEl = $("eth-address");
+    const btcInputEl = $("btc-address");
+    const chainSelect = $("chain-select");
+    const externalAddressInput = $("external-address");
 
     function shortHex(h){ if(!h) return ""; const s=h.replace(/^0x/,""); return "0x"+s.slice(0,6)+"…"+s.slice(-6); }
     function showError(msg){ console.error(msg); errEl && (errEl.textContent = msg); alert(msg); }
@@ -119,7 +142,7 @@
       };
     };
 
-    function buildTypedData(alias_key_hex, len, user_hex, nonce, chainId_hex) {
+    function buildTypedData(alias_key_hex, len, user_hex, nonce, chainId_hex, eth_felt, btc_felt) {
       const cleanHex = (h) => {
         const s = strip0x(h);
         return "0x" + (s.replace(/^0+/, "") || "0");
@@ -136,6 +159,8 @@
             { name: "alias_key", type: "felt" },
             { name: "len", type: "felt" },
             { name: "nonce", type: "felt" },
+            { name: "eth_address", type: "felt" },
+            { name: "btc_address", type: "felt" },
           ],
         },
         primaryType: "RegisterAlias",
@@ -149,6 +174,8 @@
           alias_key: toFeltHex(alias_key_hex),
           len: String(len),
           nonce: String(nonce),
+          eth_address: toFeltHex(eth_felt || "0x0"),
+          btc_address: toFeltHex(btc_felt || "0x0"),
         },
       };
     }
@@ -220,10 +247,32 @@
         if (!res.ok) throw new Error(await res.text());
         cfg = await res.json();
 
+        cfg.external_chain_ids = cfg.external_chain_ids || {};
         cfg.aic_token = padHex64(cfg.aic_token);
         cfg.relayer_address = padHex64(cfg.relayer_address);
         cfg.chain_id = "0x" + strip0x(cfg.chain_id).replace(/^0+/, '');
-        log(`Conectado: ${conn.name}\nChainId: ${cfg.chain_id}`, 'ok');
+        if (chainSelect) {
+          chainSelect.innerHTML = "";
+          const entries = Object.entries(cfg.external_chain_ids);
+          if (!entries.length) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "Sin cadenas";
+            chainSelect.appendChild(opt);
+            chainSelect.disabled = true;
+          } else {
+            chainSelect.disabled = false;
+            for (const [label, felt] of entries) {
+              const opt = document.createElement("option");
+              opt.value = label;
+              opt.textContent = `${label} (${felt})`;
+              chainSelect.appendChild(opt);
+            }
+          }
+        }
+
+        const chainLabels = Object.keys(cfg.external_chain_ids);
+        log(`Conectado: ${conn.name}\nChainId: ${cfg.chain_id}\nChains externas: ${chainLabels.length ? chainLabels.join(', ') : 'ninguna'}`, 'ok');
         okEl && (okEl.textContent = `Conectado: ${shortHex(userAddr)} (${conn.name})`);
         enableButtons(true, false, false, false);
       } catch (e) {
@@ -240,6 +289,12 @@
       $("out").innerHTML = "";
       okEl && (okEl.textContent = "");
       errEl && (errEl.textContent = "");
+      ethInputEl && (ethInputEl.value = "");
+      btcInputEl && (btcInputEl.value = "");
+      externalAddressInput && (externalAddressInput.value = "");
+      if (chainSelect && chainSelect.options.length) {
+        chainSelect.selectedIndex = 0;
+      }
       enableButtons(false, false, false, false);
       log("Reset OK");
     };
@@ -248,16 +303,42 @@
       if (!userAddr) { alert("Conectá wallet"); return; }
       const alias = $("alias").value.trim();
       if (!alias) { alert("Ingresá un alias"); return; }
+      const ethRaw = ethInputEl ? ethInputEl.value.trim() : "";
+      const btcRaw = btcInputEl ? btcInputEl.value.trim() : "";
 
       try {
         const res = await fetch(apiUrl("/api/prepare"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_address: userAddr, alias })
+          body: JSON.stringify({
+            user_address: userAddr,
+            alias,
+            eth_address: ethRaw || null,
+            btc_address: btcRaw || null,
+          })
         });
         if (!res.ok) throw new Error(await res.text());
-        prepared = await res.json();
-        $("prep").textContent = `✓ Alias: ${alias}\n  Key: ${prepared.alias_key}\n  Fee: ${prepared.fee_aic_wei} wei`;
+        const data = await res.json();
+        prepared = {
+          ...data,
+          alias_input: alias,
+          eth_input: ethRaw,
+          btc_input: btcRaw,
+        };
+        const lines = [
+          `✓ Alias: ${alias}`,
+          `  Key: ${prepared.alias_key}`,
+          `  Fee: ${prepared.fee_aic_wei} wei`,
+        ];
+        if (prepared.eth_address_felt && prepared.eth_address_felt !== "0x0") {
+          const extra = prepared.eth_address_ascii ? ` (ascii: ${prepared.eth_address_ascii})` : "";
+          lines.push(`  ETH felt: ${prepared.eth_address_felt}${extra}`);
+        }
+        if (prepared.btc_address_felt && prepared.btc_address_felt !== "0x0") {
+          const extra = prepared.btc_address_ascii ? ` (ascii: ${prepared.btc_address_ascii})` : "";
+          lines.push(`  BTC felt: ${prepared.btc_address_felt}${extra}`);
+        }
+        $("prep").textContent = lines.join("\n");
         log("Preparado OK. Ahora hacé approve.", 'ok');
         enableButtons(true, true, false, false);
       } catch (e) {
@@ -308,7 +389,13 @@
       if (!prepared || !account) { alert("Falta preparar"); return; }
       try {
         const typed = buildTypedData(
-          prepared.alias_key, prepared.len, userAddr, prepared.nonce, cfg.chain_id
+          prepared.alias_key,
+          prepared.len,
+          userAddr,
+          prepared.nonce,
+          cfg.chain_id,
+          prepared.eth_address_felt,
+          prepared.btc_address_felt
         );
         const sig = await signTypedMessageWithFallback(account, typed);
         prepared.signature = sig;
@@ -329,9 +416,11 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             user_address: userAddr,
-            alias: $("alias").value.trim(),
+            alias: prepared.alias_input || $("alias").value.trim(),
             signature: prepared.signature,
-            nonce: prepared.nonce
+            nonce: prepared.nonce,
+            eth_address: prepared.eth_address_felt,
+            btc_address: prepared.btc_address_felt,
           })
         });
         if (!res.ok) throw new Error(await res.text());
@@ -340,6 +429,8 @@
         prepared = null;
         $("prep").textContent = "";
         $("alias").value = "";
+        ethInputEl && (ethInputEl.value = "");
+        btcInputEl && (btcInputEl.value = "");
         enableButtons(true, false, false, false);
       } catch (e) {
         log(`Error: ${e.message}`, 'err');
@@ -362,6 +453,19 @@
       if (!addr) { alert("Ingresá un address 0x"); return; }
       try {
         const r = await getJSON(apiUrl(`/api/resolve_address?address=${encodeURIComponent(addr)}`));
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    $("btn-resolve-external").onclick = async () => {
+      const chain = chainSelect ? chainSelect.value : "";
+      const ext = externalAddressInput ? externalAddressInput.value.trim() : "";
+      if (!chain) { alert("Elegí una red externa"); return; }
+      if (!ext) { alert("Ingresá una dirección externa"); return; }
+      try {
+        const r = await getJSON(apiUrl(`/api/alias_of_external?chain=${encodeURIComponent(chain)}&external_address=${encodeURIComponent(ext)}`));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
