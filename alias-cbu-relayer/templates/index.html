@@ -84,6 +84,7 @@
     </div>
     <div class="row" style="margin-top:.5rem;">
       <button id="btn-list">Listar (índice local del relayer)</button>
+      <button id="btn-list-contract">Listar on-chain (AliasExternalUpdated)</button>
     </div>
     <div class="row" style="margin-top:.5rem;">
   <button id="btn-faucet" style="background:#0a0; color:#fff;">🚰 Faucet AIC</button>
@@ -535,6 +536,29 @@
     $("btn-list").onclick = async () => {
       try {
         const r = await getJSON(apiUrl("/api/list"));
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    $("btn-list-contract").onclick = async () => {
+      try {
+        const limitRaw = prompt("Cantidad de eventos a leer (1-100, vacío = 20)", "");
+        const params = [];
+        if (limitRaw && limitRaw.trim()) {
+          const parsed = Number.parseInt(limitRaw, 10);
+          if (!Number.isNaN(parsed)) {
+            const safe = Math.max(1, Math.min(parsed, 100));
+            params.push(`limit=${safe}`);
+          }
+        }
+        const tokenRaw = prompt("continuation_token (opcional)", "");
+        if (tokenRaw && tokenRaw.trim()) {
+          params.push(`continuation_token=${encodeURIComponent(tokenRaw.trim())}`);
+        }
+        const qs = params.length ? `?${params.join("&")}` : "";
+        const r = await getJSON(apiUrl(`/api/contract_events${qs}`));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);

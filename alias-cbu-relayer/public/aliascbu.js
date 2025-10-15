@@ -295,6 +295,16 @@
     return await httpJson(apiUrl(`/api/resolve_address?address=${q}`));
   }
 
+  async function listContractEvents(opts = {}) {
+    const params = new URLSearchParams();
+    const limit = opts.limit ?? opts.chunkSize ?? opts.chunk_size;
+    if (limit != null) params.set("limit", String(limit));
+    if (opts.continuationToken) params.set("continuation_token", opts.continuationToken);
+    if (opts.continuation_token) params.set("continuation_token", opts.continuation_token);
+    const qs = params.toString();
+    return await httpJson(apiUrl(`/api/contract_events${qs ? `?${qs}` : ""}`));
+  }
+
   async function faucet(address) {
     const addr = address || state.address;
     if (!addr) throw new Error("Falta address (o conectá la wallet)");
@@ -319,6 +329,7 @@
       submit,
       resolveAlias,
       resolveAddress,
+      listContractEvents,
       faucet,
     };
   }
