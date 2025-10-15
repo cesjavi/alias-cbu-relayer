@@ -84,6 +84,7 @@
     </div>
     <div class="row" style="margin-top:.5rem;">
       <button id="btn-list">Listar (índice local del relayer)</button>
+      <button id="btn-list-contract">Listar on-chain (AliasExternalUpdated)</button>
     </div>
     <div class="row" style="margin-top:.5rem;">
   <button id="btn-faucet" style="background:#0a0; color:#fff;">🚰 Faucet AIC</button>
@@ -180,25 +181,63 @@
       };
     }
 
+    function detectXverse() {
+      const guesses = [];
+      if (window.starknet_xverse) guesses.push(window.starknet_xverse);
+      const providers = window.xverseProviders;
+      if (providers?.starknet) guesses.push(providers.starknet);
+      if (window.xverse) {
+        if (window.xverse.starknet) guesses.push(window.xverse.starknet);
+        if (window.xverse.starknetProvider) guesses.push(window.xverse.starknetProvider);
+      }
+      if (window.xverseProvider) guesses.push(window.xverseProvider);
+      if (window.xverseWallet?.starknet) guesses.push(window.xverseWallet.starknet);
+      if (window.btc?.starknet) guesses.push(window.btc.starknet);
+      for (const guess of guesses) {
+        if (!guess) continue;
+        if (typeof guess === "function") {
+          try {
+            const maybe = guess();
+            if (maybe) return maybe;
+          } catch (e) {}
+        }
+        if (typeof guess.getProvider === "function") {
+          try {
+            const provider = guess.getProvider();
+            if (provider) return provider;
+          } catch (e) {}
+        }
+        if (guess?.provider) return guess.provider;
+        if (guess?.request || guess?.enable || guess?.account || guess?.selectedAddress || guess?.selectedAccount) {
+          return guess;
+        }
+      }
+      return null;
+    }
+
     function waitForWallets(ms = 8000) {
       return new Promise((resolve) => {
         const kick = () => {
           const sn = window.starknet || null;
           const argentx = (sn && sn.isArgentX) ? sn : (window.starknet_argentX || null);
           const braavos = (sn && sn.isBraavos) ? sn : (window.starknet_braavos || window.braavos || null);
-          resolve({ braavos, argentx });
+          const xverse = detectXverse();
+          resolve({ braavos, argentx, xverse });
         };
-        if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX) return kick();
-        window.addEventListener('starknet#initialized', () => kick(), { once: true });
+        if (window.starknet || window.starknet_braavos || window.braavos || window.starknet_argentX || window.starknet_xverse || window.xverseProviders || window.xverse || window.xverseProvider || window.xverseWallet) return kick();
+        const handler = () => kick();
+        window.addEventListener('starknet#initialized', handler, { once: true });
+        window.addEventListener('xverse#initialized', handler, { once: true });
         setTimeout(kick, ms);
       });
     }
 
     async function connectDirect() {
-      const { braavos, argentx } = await waitForWallets(8000);
+      const { braavos, argentx, xverse } = await waitForWallets(8000);
       const candidates = [
         { name: 'ArgentX', obj: argentx },
         { name: 'Braavos', obj: braavos },
+        { name: 'Xverse', obj: xverse },
         { name: 'Braavos (legacy)', obj: window.braavos }
       ];
       for (const { name, obj } of candidates) {
@@ -213,10 +252,10 @@
           console.warn(`${name} falló:`, e?.message || e);
         }
       }
-      throw new Error("No se encontró Braavos ni ArgentX. Revisá 'Site access' en la extensión y recargá.");
+      throw new Error("No se encontró ArgentX, Braavos ni Xverse. Revisá 'Site access' en la extensión y recargá.");
     }
 
-    let account = null, userAddr = null, prepared = null, cfg = null;
+    let account = null, userAddr = null, prepared = null, cfg = null, walletName = null;
 
     function enableButtons(p, a, s, su) {
       $("btn-prepare").disabled = !p;
@@ -240,6 +279,7 @@
         const conn = await connectDirect();
         account = conn.account;
         userAddr = padHex64(conn.address);
+        walletName = conn.name;
         $("acc").textContent = `${userAddr.slice(0,10)}...${userAddr.slice(-8)} (${conn.name})`;
 
         log("Obteniendo configuración desde backend...", "info");
@@ -283,6 +323,7 @@
 
     $("btn-reset").onclick = () => {
       account = userAddr = prepared = cfg = null;
+      walletName = null;
       $("acc").textContent = "";
       $("prep").textContent = "";
       $("resolve-out").textContent = "";
@@ -374,7 +415,27 @@
         if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
         return sig;
       } catch (e) {
-        console.warn("signMessage estándar falló, probando Braavos.request:", e);
+        console.warn("signMessage estándar falló, probando request directa:", e);
+      }
+      if (walletName === 'Xverse') {
+        const xverse = detectXverse();
+        if (xverse?.request) {
+          const payloads = [
+            { type: "wallet_signTypedData", params: typed },
+            { type: "wallet_signTypedData", params: [typed] },
+            { type: "wallet_signMessage", params: typed },
+            { type: "wallet_signMessage", params: [typed] },
+          ];
+          for (const payload of payloads) {
+            try {
+              let sig = await xverse.request(payload);
+              if (sig?.result) sig = sig.result;
+              if (!sig) continue;
+              if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
+              if (Array.isArray(sig)) return sig;
+            } catch (_) {}
+          }
+        }
       }
       const br = window.starknet_braavos || window.braavos;
       if (br?.request) {
@@ -382,7 +443,7 @@
         if (!Array.isArray(sig) && sig?.r && sig?.s) sig = [sig.r, sig.s];
         return sig;
       }
-      throw new Error("No se pudo firmar el mensaje.");
+      throw new Error("No se pudo firmar el mensaje (wallet no respondió).");
     }
 
     $("btn-sign").onclick = async () => {
@@ -475,6 +536,29 @@
     $("btn-list").onclick = async () => {
       try {
         const r = await getJSON(apiUrl("/api/list"));
+        $("resolve-out").textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("resolve-out").textContent = "Error: " + (e.message || e);
+      }
+    };
+
+    $("btn-list-contract").onclick = async () => {
+      try {
+        const limitRaw = prompt("Cantidad de eventos a leer (1-100, vacío = 20)", "");
+        const params = [];
+        if (limitRaw && limitRaw.trim()) {
+          const parsed = Number.parseInt(limitRaw, 10);
+          if (!Number.isNaN(parsed)) {
+            const safe = Math.max(1, Math.min(parsed, 100));
+            params.push(`limit=${safe}`);
+          }
+        }
+        const tokenRaw = prompt("continuation_token (opcional)", "");
+        if (tokenRaw && tokenRaw.trim()) {
+          params.push(`continuation_token=${encodeURIComponent(tokenRaw.trim())}`);
+        }
+        const qs = params.length ? `?${params.join("&")}` : "";
+        const r = await getJSON(apiUrl(`/api/contract_events${qs}`));
         $("resolve-out").textContent = JSON.stringify(r, null, 2);
       } catch (e) {
         $("resolve-out").textContent = "Error: " + (e.message || e);
