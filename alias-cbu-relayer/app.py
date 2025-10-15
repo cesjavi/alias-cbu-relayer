@@ -434,41 +434,38 @@ async def submit(data: SubmitIn):
     resp = None
     last_error: Optional[Exception] = None
 
-    try:
-        import inspect
+    import inspect
 
-        sig = inspect.signature(relayer.execute_v3)
-        kwargs = {"calls": calls}
+    sig = inspect.signature(relayer.execute_v3)
+    params = sig.parameters
 
-        if "auto_estimate" in sig.parameters:
-            kwargs["auto_estimate"] = True
-        elif "estimate_fee_mode" in sig.parameters:
-            kwargs["estimate_fee_mode"] = "auto"
-        else:
-            kwargs["auto_estimate"] = False
-            kwargs["max_fee"] = fee_value
+    attempts = []
 
-        resp = await relayer.execute_v3(**kwargs)
-    except Exception as primary_error:
-        last_error = primary_error
+    primary_kwargs = {"calls": calls}
+    if "auto_estimate" in params:
+        primary_kwargs["auto_estimate"] = True
+    elif "estimate_fee_mode" in params:
+        primary_kwargs["estimate_fee_mode"] = "auto"
+    attempts.append(primary_kwargs)
+
+    fallback_kwargs = {"calls": calls}
+    if "auto_estimate" in params:
+        fallback_kwargs["auto_estimate"] = False
+    if "max_fee" in params:
+        fallback_kwargs["max_fee"] = fee_value
+    elif "fee" in params:
+        fallback_kwargs["fee"] = fee_value
+
+    if fallback_kwargs != primary_kwargs:
+        attempts.append(fallback_kwargs)
+
+    for kwargs in attempts:
         try:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                max_fee=fee_value,
-            )
-        except TypeError as type_error:
-            last_error = type_error
-            try:
-                resp = await relayer.execute_v3(
-                    calls=calls,
-                    auto_estimate=False,
-                    fee=fee_value,
-                )
-            except Exception as final_error:
-                last_error = final_error
-        except Exception as fallback_error:
-            last_error = fallback_error
+            resp = await relayer.execute_v3(**kwargs)
+            break
+        except Exception as err:
+            last_error = err
+            resp = None
 
     if resp is None:
         status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
