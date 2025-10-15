@@ -217,6 +217,55 @@ def meta_message(
         f"eth:{hex(eth_address)}|btc:{hex(btc_address)}"
     )
 
+
+def _flatten_exception_message(exc: Exception) -> str:
+    """Concatena mensajes de excepciones anidadas en una sola línea legible."""
+
+    parts = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+
+    while current and id(current) not in seen:
+        seen.add(id(current))
+
+        text = getattr(current, "message", None)
+        if not text:
+            args = getattr(current, "args", None)
+            if args:
+                text = " ".join(str(arg) for arg in args if arg)
+        if not text:
+            text = str(current)
+
+        if text:
+            parts.append(str(text))
+
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    if not parts:
+        return "Error desconocido"
+
+    collapsed = " | ".join(parts)
+    collapsed = re.sub(r"\s+", " ", collapsed).strip()
+    return collapsed[:800] + ("…" if len(collapsed) > 800 else "")
+
+
+def _classify_relayer_error(exc: Exception) -> tuple[int, str]:
+    raw = _flatten_exception_message(exc)
+    upper = raw.upper()
+
+    if "ALIAS_TAKEN" in upper:
+        return 409, "Alias ya registrado on-chain (ALIAS_TAKEN)."
+    if "ETH_ADDR_IN_USE" in upper:
+        return 409, "La dirección ETH ya está asociada a otro alias (ETH_ADDR_IN_USE)."
+    if "BTC_ADDR_IN_USE" in upper:
+        return 409, "La dirección externa ya está asociada a otro alias (BTC_ADDR_IN_USE)."
+    if "INSUFFICIENT" in upper and "BALANCE" in upper:
+        return 400, "Fondos insuficientes o approve faltante para el token AIC."
+    if "TRANSFER_FROM" in upper and "FAILED" in upper:
+        return 400, "transfer_from del token AIC falló (approve/balance)."
+
+    return 500, f"Error enviando transacción: {raw}"
+
 # ==== modelos ====
 class PrepareIn(BaseModel):
     alias: str
@@ -322,8 +371,20 @@ async def submit(data: SubmitIn):
     except ValueError:
         raise HTTPException(400, "user_address inválido (hex)")
 
-    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
-        raise HTTPException(400, "Nonce invalido (prepare faltante)")
+    addr_key = data.user_address.lower()
+    if data.nonce <= 0:
+        raise HTTPException(400, "Nonce inválido")
+
+    stored_nonce = NONCES.get(addr_key)
+    if stored_nonce is None:
+        # Entorno serverless puede inicializar un nuevo worker entre prepare y submit.
+        # Persistimos el nonce recibido para no exigir preparar de nuevo cuando
+        # el estado en memoria se perdió.
+        NONCES[addr_key] = data.nonce
+    elif data.nonce > stored_nonce + 1:
+        raise HTTPException(400, "Nonce fuera de rango; volvé a preparar la firma")
+    elif data.nonce == stored_nonce + 1:
+        NONCES[addr_key] = data.nonce
 
     if data.signature and len(data.signature) >= 2:
         r_hex, s_hex = data.signature[0], data.signature[1]
@@ -343,7 +404,11 @@ async def submit(data: SubmitIn):
 
     client, relayer = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import (
+            Call,
+            ResourceBounds,
+            ResourceBoundsMapping,
+        )
         from starknet_py.hash.selector import get_selector_from_name
         try:
             from starknet_py.net.client_models import BlockId, Tag
@@ -365,6 +430,7 @@ async def submit(data: SubmitIn):
     )
 
     SAFE_FEE = int(5e17)
+    estimated_bounds: Optional[ResourceBoundsMapping] = None
     try:
         if hasattr(relayer, "_estimate_fee"):
             est = await relayer._estimate_fee(
@@ -374,41 +440,85 @@ async def submit(data: SubmitIn):
                 nonce=None,
             )
             fee_value = int(est.overall_fee * 13 // 10)
+            try:
+                estimated_bounds = est.to_resource_bounds(
+                    amount_multiplier=1.3,
+                    unit_price_multiplier=1.3,
+                )
+            except Exception as conv_err:
+                print("[warn] no se pudo convertir fee estimate a resource_bounds:", conv_err)
+                estimated_bounds = None
         else:
             raise Exception("_estimate_fee no disponible")
     except Exception as e:
         print("[warn] estimate failed, usando fee fijo:", e)
         fee_value = SAFE_FEE
 
+    if fee_value <= 0:
+        fee_value = SAFE_FEE
+
     calls = [erc20_transfer_from, alias_register]
-    try:
-        import inspect
 
-        sig = inspect.signature(relayer.execute_v3)
-        kwargs = {"calls": calls}
+    resp = None
+    last_error: Optional[Exception] = None
 
-        if "auto_estimate" in sig.parameters:
-            kwargs["auto_estimate"] = True
-        elif "estimate_fee_mode" in sig.parameters:
-            kwargs["estimate_fee_mode"] = "auto"
-        else:
-            kwargs["auto_estimate"] = False
-            kwargs["max_fee"] = fee_value
+    import inspect
 
-        resp = await relayer.execute_v3(**kwargs)
-    except Exception:
+    sig = inspect.signature(relayer.execute_v3)
+    params = sig.parameters
+
+    attempts = []
+
+    primary_kwargs = {"calls": calls}
+    if "auto_estimate" in params:
+        primary_kwargs["auto_estimate"] = True
+    elif "estimate_fee_mode" in params:
+        primary_kwargs["estimate_fee_mode"] = "auto"
+    attempts.append(primary_kwargs)
+
+    fallback_kwargs = {"calls": calls}
+    manual_fee_fields = False
+
+    if "resource_bounds" in params and estimated_bounds is not None:
+        fallback_kwargs["resource_bounds"] = ResourceBoundsMapping(
+            l1_gas=ResourceBounds(
+                max_amount=estimated_bounds.l1_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l1_gas.max_price_per_unit,
+            ),
+            l1_data_gas=ResourceBounds(
+                max_amount=estimated_bounds.l1_data_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l1_data_gas.max_price_per_unit,
+            ),
+            l2_gas=ResourceBounds(
+                max_amount=estimated_bounds.l2_gas.max_amount,
+                max_price_per_unit=estimated_bounds.l2_gas.max_price_per_unit,
+            ),
+        )
+        manual_fee_fields = True
+
+    if "max_fee" in params:
+        fallback_kwargs["max_fee"] = fee_value
+        manual_fee_fields = True
+    elif "fee" in params:
+        fallback_kwargs["fee"] = fee_value
+        manual_fee_fields = True
+
+    if manual_fee_fields:
+        if "auto_estimate" in params:
+            fallback_kwargs["auto_estimate"] = False
+        attempts.append(fallback_kwargs)
+
+    for kwargs in attempts:
         try:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                max_fee=fee_value,
-            )
-        except TypeError:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                fee=fee_value,
-            )
+            resp = await relayer.execute_v3(**kwargs)
+            break
+        except Exception as err:
+            last_error = err
+            resp = None
+
+    if resp is None:
+        status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
+        raise HTTPException(status_code, message)
 
     tx_hash = getattr(resp, "transaction_hash", resp)
 
