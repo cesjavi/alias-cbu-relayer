@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os, re
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
@@ -47,6 +47,14 @@ RELAYER_ACCOUNT_ADDRESS = _get_env_hex("RELAYER_ACCOUNT_ADDRESS", "0x0")
 RELAYER_PRIVATE_KEY = _get_env_hex("RELAYER_PRIVATE_KEY", "0x0")
 FEE_AIC_WEI = int(os.getenv("FEE_AIC_WEI", "0") or "0")
 CHAIN_ID = _get_env_hex("CHAIN_ID", "0x1")  # por defecto 0x1
+
+CHAIN_ID_ETHEREUM_FELT = int.from_bytes(b"ETH", "big")
+CHAIN_ID_BITCOIN_FELT = int.from_bytes(b"BTC", "big")
+CHAIN_LABEL_TO_FELT = {
+    "ETH": CHAIN_ID_ETHEREUM_FELT,
+    "BTC": CHAIN_ID_BITCOIN_FELT,
+}
+FELT_TO_CHAIN_LABEL = {value: key for key, value in CHAIN_LABEL_TO_FELT.items()}
 
 # ==== App FastAPI ====
 app = FastAPI(title="AliasCBU Relayer (Gasless AIC)")
@@ -100,11 +108,12 @@ def _get_client_and_relayer():
 
 # ==== Utilidades alias ====
 ALIAS_REGEX = re.compile(r"^[a-z0-9.]{4,20}$")
-NONCES: dict[str, int] = {}
+NONCES: Dict[str, int] = {}
 
-# índice en memoria
-ALIAS_INDEX: Dict[str, Tuple[str, str]] = {}  # alias_key_hex -> (user_address_hex, alias_str)
-ADDR_INDEX: Dict[str, Tuple[str, str]] = {}   # address_hex -> (alias_key_hex, alias_str)
+# Índice en memoria enriquecido
+ALIAS_INDEX: Dict[str, Dict[str, str]] = {}
+ADDR_INDEX: Dict[str, Dict[str, str]] = {}
+EXTERNAL_INDEX: Dict[str, Dict[str, Dict[str, str]]] = {"ETH": {}, "BTC": {}}
 
 def normalize_alias(s: str) -> str:
     alias = s.strip().lower()
@@ -125,25 +134,102 @@ def alias_key(alias: str) -> int:
     h_bytes = _keccak_bytes(alias.encode("utf-8"))
     return int.from_bytes(h_bytes, "big") % FIELD_P
 
+
+def encode_external_address(value: Optional[str], *, label: str) -> int:
+    if not value:
+        return 0
+
+    raw = value.strip()
+    if not raw:
+        return 0
+
+    if raw.startswith("0x") or raw.startswith("0X"):
+        try:
+            return int(raw, 16) % FIELD_P
+        except Exception:
+            raise HTTPException(400, f"{label} inválido (hex)")
+
+    try:
+        data = raw.encode("ascii")
+    except Exception:
+        raise HTTPException(400, f"{label} debe ser ASCII o hex 0x…")
+
+    as_int = int.from_bytes(data, "big")
+    if as_int >= FIELD_P:
+        raise HTTPException(400, f"{label} demasiado largo; convertí a hex o hash")
+    return as_int
+
+
+def felt_to_ascii_str(value: int) -> Optional[str]:
+    if value == 0:
+        return None
+    length = max(1, (value.bit_length() + 7) // 8)
+    try:
+        raw = value.to_bytes(length, "big")
+    except OverflowError:
+        return None
+    try:
+        text = raw.decode("ascii")
+    except Exception:
+        return None
+    text = text.strip("\x00")
+    return text or None
+
+
+def format_external_value(value: int) -> Dict[str, Optional[str]]:
+    ascii_val = felt_to_ascii_str(value)
+    return {
+        "felt_hex": hex(value),
+        "as_ascii": ascii_val,
+    }
+
+
+def parse_chain_identifier(raw: str) -> int:
+    key = (raw or "").strip()
+    if not key:
+        raise HTTPException(400, "Falta chain")
+
+    upper = key.upper()
+    if upper in CHAIN_LABEL_TO_FELT:
+        return CHAIN_LABEL_TO_FELT[upper]
+
+    try:
+        return int(key, 16)
+    except Exception:
+        raise HTTPException(400, f"chain inválido: {raw}")
+
 def next_nonce(addr_hex: str) -> int:
     n = NONCES.get(addr_hex.lower(), 0) + 1
     NONCES[addr_hex.lower()] = n
     return n
 
-def meta_message(alias_key_int: int, length: int, user_addr: int, nonce: int) -> str:
+def meta_message(
+    alias_key_int: int,
+    length: int,
+    user_addr: int,
+    nonce: int,
+    eth_address: int,
+    btc_address: int,
+) -> str:
     return (
         f"AliasCBU|register|alias_key:{hex(alias_key_int)}|"
-        f"len:{length}|user:{hex(user_addr)}|nonce:{nonce}|chain:{hex(CHAIN_ID)}"
+        f"len:{length}|user:{hex(user_addr)}|nonce:{nonce}|chain:{hex(CHAIN_ID)}|"
+        f"eth:{hex(eth_address)}|btc:{hex(btc_address)}"
     )
 
 # ==== modelos ====
 class PrepareIn(BaseModel):
     alias: str
     user_address: str
+    eth_address: Optional[str] = None
+    btc_address: Optional[str] = None
+
 
 class SubmitIn(BaseModel):
     user_address: str
     alias: str
+    eth_address: Optional[str] = None
+    btc_address: Optional[str] = None
     signature_r: Optional[str] = None
     signature_s: Optional[str] = None
     signature: Optional[list[str]] = None
@@ -178,6 +264,10 @@ async def config():
         "alias_contract": hex(ALIAS_CONTRACT),
         "chain_id": hex(CHAIN_ID),
         "fee_aic_wei": str(FEE_AIC_WEI),
+        "external_chain_ids": {
+            "ETH": hex(CHAIN_ID_ETHEREUM_FELT),
+            "BTC": hex(CHAIN_ID_BITCOIN_FELT),
+        },
         "missing_envs": missing,   # <- para debug en Vercel
     }
 
@@ -198,7 +288,10 @@ async def prepare(data: PrepareIn):
 
     nonce = next_nonce(data.user_address)
 
-    msg = meta_message(k, ln, user_int, nonce)
+    eth_int = encode_external_address(data.eth_address, label="eth_address")
+    btc_int = encode_external_address(data.btc_address, label="btc_address")
+
+    msg = meta_message(k, ln, user_int, nonce, eth_int, btc_int)
     return {
         "alias_normalized": alias_norm,
         "alias_key": hex(k),
@@ -207,11 +300,15 @@ async def prepare(data: PrepareIn):
         "message": msg,
         "fee_aic_wei": str(FEE_AIC_WEI),
         "aic_token": hex(AIC_TOKEN),
+        "eth_address_felt": hex(eth_int),
+        "btc_address_felt": hex(btc_int),
+        "eth_address_ascii": felt_to_ascii_str(eth_int),
+        "btc_address_ascii": felt_to_ascii_str(btc_int),
     }
+
 
 @app.post("/api/submit")
 async def submit(data: SubmitIn):
-    # Validaciones básicas
     try:
         alias_norm = normalize_alias(data.alias)
     except ValueError as e:
@@ -228,7 +325,6 @@ async def submit(data: SubmitIn):
     if NONCES.get(data.user_address.lower(), 0) < data.nonce:
         raise HTTPException(400, "Nonce invalido (prepare faltante)")
 
-    # Firma (passthrough)
     if data.signature and len(data.signature) >= 2:
         r_hex, s_hex = data.signature[0], data.signature[1]
     else:
@@ -237,11 +333,14 @@ async def submit(data: SubmitIn):
         r_hex, s_hex = data.signature_r, data.signature_s
 
     try:
-        int(r_hex, 16); int(s_hex, 16)
+        int(r_hex, 16)
+        int(s_hex, 16)
     except Exception:
         raise HTTPException(400, "Firma inválida (hex)")
 
-    # --- Construcción de la tx ---
+    eth_int = encode_external_address(data.eth_address, label="eth_address")
+    btc_int = encode_external_address(data.btc_address, label="btc_address")
+
     client, relayer = _get_client_and_relayer()
     try:
         from starknet_py.net.client_models import Call
@@ -257,23 +356,22 @@ async def submit(data: SubmitIn):
     erc20_transfer_from = Call(
         to_addr=AIC_TOKEN,
         selector=get_selector_from_name("transfer_from"),
-        calldata=[user, relayer.address, FEE_AIC_WEI, 0]
+        calldata=[user, relayer.address, FEE_AIC_WEI, 0],
     )
     alias_register = Call(
         to_addr=ALIAS_CONTRACT,
         selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]
+        calldata=[k, ln, user, eth_int, btc_int],
     )
 
-    # ===== Estimar fee con fallback =====
-    SAFE_FEE = int(5e17)  # 0.5 STRK
+    SAFE_FEE = int(5e17)
     try:
         if hasattr(relayer, "_estimate_fee"):
             est = await relayer._estimate_fee(
                 calls=[erc20_transfer_from, alias_register],
                 block_id=block_id_pending,
                 version=3,
-                nonce=None
+                nonce=None,
             )
             fee_value = int(est.overall_fee * 13 // 10)
         else:
@@ -282,226 +380,71 @@ async def submit(data: SubmitIn):
         print("[warn] estimate failed, usando fee fijo:", e)
         fee_value = SAFE_FEE
 
-    
-    # ===== Ejecutar con compatibilidad total (v0.27+ incluido) =====
+    calls = [erc20_transfer_from, alias_register]
     try:
         import inspect
+
         sig = inspect.signature(relayer.execute_v3)
-        kwargs = {}
+        kwargs = {"calls": calls}
 
         if "auto_estimate" in sig.parameters:
-            # Versión moderna: usar auto_estimate=True
             kwargs["auto_estimate"] = True
         elif "estimate_fee_mode" in sig.parameters:
-            # Alternativa de 0.27.x+
             kwargs["estimate_fee_mode"] = "auto"
         else:
-            print("[warn] execute_v3 sin auto_estimate, intentando vacío")
+            kwargs["auto_estimate"] = False
+            kwargs["max_fee"] = fee_value
 
-        resp = await relayer.execute_v3(
-            calls=[erc20_transfer_from, alias_register],
-            **kwargs
-        )
-        tx_hash = getattr(resp, "transaction_hash", resp)
-    except Exception as e:
-        raise HTTPException(500, f"Error enviando tx: {e}")
-
-
-    # Índice en memoria
-    alias_key_hex = hex(k)
-    addr_hex = hex(user)
-    ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
-    ADDR_INDEX[addr_hex] = (alias_key_hex, alias_norm)
-
-    return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
-
-async def submit(data: SubmitIn):
-    # Validaciones básicas
-    try:
-        alias_norm = normalize_alias(data.alias)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    k = alias_key(alias_norm)
-    ln = len(alias_norm)
-
-    try:
-        user = int(data.user_address, 16)
-    except ValueError:
-        raise HTTPException(400, "user_address inválido (hex)")
-
-    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
-        raise HTTPException(400, "Nonce invalido (prepare faltante)")
-
-    # Firma (passthrough)
-    if data.signature and len(data.signature) >= 2:
-        r_hex, s_hex = data.signature[0], data.signature[1]
-    else:
-        if not (data.signature_r and data.signature_s):
-            raise HTTPException(400, "Falta firma (signature o r/s)")
-        r_hex, s_hex = data.signature_r, data.signature_s
-
-    try:
-        int(r_hex, 16); int(s_hex, 16)
+        resp = await relayer.execute_v3(**kwargs)
     except Exception:
-        raise HTTPException(400, "Firma inválida (hex)")
-
-    client, relayer = _get_client_and_relayer()
-    try:
-        from starknet_py.net.client_models import Call
-        from starknet_py.hash.selector import get_selector_from_name
         try:
-            from starknet_py.net.client_models import BlockId, Tag
-            block_id_pending = BlockId(tag=Tag.PENDING)
-        except Exception:
-            # Compatibilidad con versiones viejas
-            block_id_pending = "pending"
-    except Exception as e:
-        raise HTTPException(500, f"starknet_py no disponible: {e}")
-
-    erc20_transfer_from = Call(
-        to_addr=AIC_TOKEN,
-        selector=get_selector_from_name("transfer_from"),
-        calldata=[user, relayer.address, FEE_AIC_WEI, 0]
-    )
-    alias_register = Call(
-        to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]
-    )
-
-    # ===== Estimar con 'pending' y fallback a fee fijo =====
-    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK (ajustá si hace falta)
-    try:
-        # versiones viejas pueden no tener _estimate_fee, por eso se captura
-        if hasattr(relayer, "_estimate_fee"):
-            est = await relayer._estimate_fee(
-                calls=[erc20_transfer_from, alias_register],
-                block_id=block_id_pending,
-                version=3,
-                nonce=None
+            resp = await relayer.execute_v3(
+                calls=calls,
+                auto_estimate=False,
+                max_fee=fee_value,
             )
-            max_fee = int(est.overall_fee * 13 // 10)
-        else:
-            raise Exception("_estimate_fee no disponible")
-    except Exception as e:
-        print("[warn] estimate failed, using SAFE_MAX_FEE fallback:", e)
-        max_fee = SAFE_MAX_FEE_FALLBACK
+        except TypeError:
+            resp = await relayer.execute_v3(
+                calls=calls,
+                auto_estimate=False,
+                fee=fee_value,
+            )
 
-    try:
-        resp = await relayer.execute_v3(
-            calls=[erc20_transfer_from, alias_register],
-            auto_estimate=False,
-            max_fee=max_fee
-        )
-        tx_hash = resp.transaction_hash
-    except Exception as e:
-        raise HTTPException(500, f"Error enviando tx: {e}")
+    tx_hash = getattr(resp, "transaction_hash", resp)
 
     alias_key_hex = hex(k)
     addr_hex = hex(user)
-    ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
-    ADDR_INDEX[addr_hex] = (alias_key_hex, alias_norm)
+    eth_hex = hex(eth_int)
+    btc_hex = hex(btc_int)
 
-    return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
+    previous = ALIAS_INDEX.get(alias_key_hex)
+    if previous:
+        prev_eth = previous.get("eth_address")
+        prev_btc = previous.get("btc_address")
+        if prev_eth and prev_eth != eth_hex:
+            EXTERNAL_INDEX["ETH"].pop(prev_eth, None)
+        if prev_btc and prev_btc != btc_hex:
+            EXTERNAL_INDEX["BTC"].pop(prev_btc, None)
 
-    # Validaciones básicas
-    try:
-        alias_norm = normalize_alias(data.alias)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    prev_addr_record = ADDR_INDEX.get(addr_hex)
+    if prev_addr_record and prev_addr_record is not previous:
+        EXTERNAL_INDEX["ETH"].pop(prev_addr_record.get("eth_address"), None)
+        EXTERNAL_INDEX["BTC"].pop(prev_addr_record.get("btc_address"), None)
 
-    k = alias_key(alias_norm)
-    ln = len(alias_norm)
+    record = {
+        "alias_key": alias_key_hex,
+        "alias": alias_norm,
+        "address": addr_hex,
+        "eth_address": eth_hex,
+        "btc_address": btc_hex,
+    }
 
-    try:
-        user = int(data.user_address, 16)
-    except ValueError:
-        raise HTTPException(400, "user_address inválido (hex)")
-
-    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
-        raise HTTPException(400, "Nonce invalido (prepare faltante)")
-
-    # Firma (passthrough)
-    if data.signature and len(data.signature) >= 2:
-        r_hex, s_hex = data.signature[0], data.signature[1]
-    else:
-        if not (data.signature_r and data.signature_s):
-            raise HTTPException(400, "Falta firma (signature o r/s)")
-        r_hex, s_hex = data.signature_r, data.signature_s
-
-    try:
-        int(r_hex, 16); int(s_hex, 16)
-    except Exception:
-        raise HTTPException(400, "Firma inválida (hex)")
-
-    # --- Enviar multicall ---
-    # Lazy import + construcción de cliente/relayer recién ahora
-    client, relayer = _get_client_and_relayer()
-    try:
-        from starknet_py.net.client_models import Call, Tag, BlockId
-        from starknet_py.hash.selector import get_selector_from_name
-        from starknet_py.net.client_errors import ClientError
-    except Exception as e:
-        raise HTTPException(500, f"starknet_py no disponible: {e}")
-
-    erc20_transfer_from = Call(
-        to_addr=AIC_TOKEN,
-        selector=get_selector_from_name("transfer_from"),
-        calldata=[user, relayer.address, FEE_AIC_WEI, 0]  # u256: (low, high)
-    )
-    alias_register = Call(
-        to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user]   # <— pasa el 'who'
-    )
-
-        # ===== Estimar con 'pending' y fallback a fee fijo =====
-    SAFE_MAX_FEE_FALLBACK = int(5e17)  # 0.5 STRK
-    try:
-        if hasattr(relayer, "_estimate_fee"):
-            est = await relayer._estimate_fee(
-                calls=[erc20_transfer_from, alias_register],
-                block_id=block_id_pending,
-                version=3,
-                nonce=None
-            )
-            max_fee = int(est.overall_fee * 13 // 10)
-        else:
-            raise Exception("_estimate_fee no disponible")
-    except Exception as e:
-        print("[warn] estimate failed, using SAFE_MAX_FEE fallback:", e)
-        max_fee = SAFE_MAX_FEE_FALLBACK
-
-    # ===== Ejecutar la transacción (compatibilidad entre versiones) =====
-    try:
-        # versiones nuevas aceptan 'max_fee', viejas solo 'fee'
-        kwargs = {"auto_estimate": False}
-        try:
-            relayer.execute_v3.__signature__  # prueba de introspección
-            # usamos 'fee' por compatibilidad si no acepta 'max_fee'
-            import inspect
-            if "max_fee" in inspect.signature(relayer.execute_v3).parameters:
-                kwargs["max_fee"] = max_fee
-            else:
-                kwargs["fee"] = max_fee
-        except Exception:
-            kwargs["fee"] = max_fee
-
-        resp = await relayer.execute_v3(
-            calls=[erc20_transfer_from, alias_register],
-            **kwargs
-        )
-        tx_hash = getattr(resp, "transaction_hash", resp)
-    except Exception as e:
-        raise HTTPException(500, f"Error enviando tx: {e}")
-
-
-    # Índice en memoria
-    alias_key_hex = hex(k)
-    addr_hex = hex(user)
-    ALIAS_INDEX[alias_key_hex] = (addr_hex, alias_norm)
-    ADDR_INDEX[addr_hex] = (alias_key_hex, alias_norm)
+    ALIAS_INDEX[alias_key_hex] = record
+    ADDR_INDEX[addr_hex] = record
+    if eth_int:
+        EXTERNAL_INDEX["ETH"][eth_hex] = record
+    if btc_int:
+        EXTERNAL_INDEX["BTC"][btc_hex] = record
 
     return {"ok": True, "tx_hash": hex(tx_hash), "relayer": hex(relayer.address)}
 
@@ -515,18 +458,43 @@ async def resolve_alias(alias: str):
     try:
         from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
+        block_kwargs = {}
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
 
-        # 👇 starknet-py 0.28.0 usa block_number="latest" (NO block_id)
-        res = await client.call_contract(
+            block_kwargs["block_id"] = BlockId(tag=Tag.LATEST)
+        except Exception:
+            block_kwargs["block_number"] = "latest"
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    try:
+        res_addr = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("addr_of_alias"),
                 calldata=[k],
             ),
-            block_number="latest"
+            **block_kwargs,
         )
+        onchain_addr_int = int(res_addr[0]) if res_addr else 0
 
-        onchain_addr = hex(res[0])
+        eth_res = await client.call_contract(
+            call=Call(
+                to_addr=ALIAS_CONTRACT,
+                selector=get_selector_from_name("external_address_of"),
+                calldata=[k, CHAIN_ID_ETHEREUM_FELT],
+            ),
+            **block_kwargs,
+        )
+        btc_res = await client.call_contract(
+            call=Call(
+                to_addr=ALIAS_CONTRACT,
+                selector=get_selector_from_name("external_address_of"),
+                calldata=[k, CHAIN_ID_BITCOIN_FELT],
+            ),
+            **block_kwargs,
+        )
     except Exception as e:
         raise HTTPException(500, f"Error on-chain: {e}")
 
@@ -534,14 +502,18 @@ async def resolve_alias(alias: str):
     return {
         "alias": alias_norm,
         "alias_key": hex(k),
-        "onchain_address": onchain_addr,
-        "memory_index": {"address": mem[0], "alias": mem[1]} if mem else None,
+        "onchain_registered": onchain_addr_int != 0,
+        "onchain_address": hex(onchain_addr_int),
+        "external_addresses": {
+            "ETH": format_external_value(int(eth_res[0]) if eth_res else 0),
+            "BTC": format_external_value(int(btc_res[0]) if btc_res else 0),
+        },
+        "memory_index": dict(mem) if mem else None,
     }
 
 
 @app.get("/api/resolve_address")
 async def resolve_address(address: str):
-    # 1) parsear address
     try:
         addr_int = int(address, 16)
     except ValueError:
@@ -551,73 +523,179 @@ async def resolve_address(address: str):
     try:
         from starknet_py.net.client_models import Call
         from starknet_py.hash.selector import get_selector_from_name
+        block_kwargs = {}
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
+
+            block_kwargs["block_id"] = BlockId(tag=Tag.LATEST)
+        except Exception:
+            block_kwargs["block_number"] = "latest"
     except Exception as e:
         raise HTTPException(500, f"starknet_py no disponible: {e}")
 
-    # 2) llamar a la view on-chain: alias_of_addr(address) -> felt252
     try:
-        res = await client.call_contract(
+        alias_res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_of_addr"),
                 calldata=[addr_int],
             ),
-            block_number="latest",   # starknet-py 0.28.x
+            **block_kwargs,
         )
-        alias_felt = int(res[0]) if res else 0
-    except Exception as e:
-        raise HTTPException(500, f"Error on-chain: {e}")
+        alias_felt = int(alias_res[0]) if alias_res else 0
 
-    # 3) decodificar felt -> ascii (si corresponde)
-    def felt_to_ascii(f: int) -> str:
-        if f == 0:
-            return ""
-        # 32 bytes big-endian, quitar ceros a la izquierda y decodificar
-        raw = f.to_bytes(32, "big").lstrip(b"\x00")
-        try:
-            s = raw.decode("ascii", errors="ignore")
-        except Exception:
-            return ""
-        # filtrar por tu regex permitida (a-z 0-9 .)
-        s = "".join(ch for ch in s if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == ".")
-        return s
-
-    alias_text = felt_to_ascii(alias_felt) or None
-
-    # 4) opcional: también devolver la key on-chain (si tu contrato la expone)
-    onchain_key = None
-    try:
-        res2 = await client.call_contract(
+        key_res = await client.call_contract(
             call=Call(
                 to_addr=ALIAS_CONTRACT,
                 selector=get_selector_from_name("alias_key_of_addr"),
                 calldata=[addr_int],
             ),
-            block_number="latest",
+            **block_kwargs,
         )
-        onchain_key = hex(res2[0]) if res2 else None
-    except Exception:
-        # ignoramos si no existe o falla
-        pass
+        alias_key = int(key_res[0]) if key_res else 0
+    except Exception as e:
+        raise HTTPException(500, f"Error on-chain: {e}")
 
-    # 5) mirar índice en memoria (si lo tuviéramos por este relayer)
+    alias_text = felt_to_ascii_str(alias_felt)
+    if alias_text and not ALIAS_REGEX.fullmatch(alias_text):
+        alias_text = None
+
     mem = ADDR_INDEX.get(hex(addr_int))
-    alias_from_mem = mem[1] if mem else None
+    if not alias_text and mem:
+        alias_text = mem.get("alias")
+
+    eth_value = 0
+    btc_value = 0
+    if alias_key:
+        try:
+            eth_res = await client.call_contract(
+                call=Call(
+                    to_addr=ALIAS_CONTRACT,
+                    selector=get_selector_from_name("external_address_of"),
+                    calldata=[alias_key, CHAIN_ID_ETHEREUM_FELT],
+                ),
+                **block_kwargs,
+            )
+            btc_res = await client.call_contract(
+                call=Call(
+                    to_addr=ALIAS_CONTRACT,
+                    selector=get_selector_from_name("external_address_of"),
+                    calldata=[alias_key, CHAIN_ID_BITCOIN_FELT],
+                ),
+                **block_kwargs,
+            )
+            eth_value = int(eth_res[0]) if eth_res else 0
+            btc_value = int(btc_res[0]) if btc_res else 0
+        except Exception:
+            pass
+
+    onchain_key_hex = hex(alias_key) if alias_key else None
 
     return {
         "address": hex(addr_int),
         "alias_felt_hex": hex(alias_felt),
-        "alias": alias_text or alias_from_mem,   # <- texto si pudimos decodificar o si lo tenemos en memoria
-        "onchain_alias_key": onchain_key,        # opcional, si tu contrato la provee
-        "memory_index": {"alias_key": mem[0], "alias": mem[1]} if mem else None,
+        "alias": alias_text,
+        "onchain_alias_key": onchain_key_hex,
+        "external_addresses": {
+            "ETH": format_external_value(eth_value),
+            "BTC": format_external_value(btc_value),
+        },
+        "memory_index": dict(mem) if mem else None,
+    }
+
+
+@app.get("/api/alias_of_external")
+async def alias_of_external(chain: str, external_address: str):
+    chain_id = parse_chain_identifier(chain)
+    ext_int = encode_external_address(external_address, label="external_address")
+
+    client, _ = _get_client_and_relayer()
+    try:
+        from starknet_py.net.client_models import Call
+        from starknet_py.hash.selector import get_selector_from_name
+        block_kwargs = {}
+        try:
+            from starknet_py.net.client_models import BlockId, Tag
+
+            block_kwargs["block_id"] = BlockId(tag=Tag.LATEST)
+        except Exception:
+            block_kwargs["block_number"] = "latest"
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    try:
+        res = await client.call_contract(
+            call=Call(
+                to_addr=ALIAS_CONTRACT,
+                selector=get_selector_from_name("alias_of_external"),
+                calldata=[chain_id, ext_int],
+            ),
+            **block_kwargs,
+        )
+        alias_key = int(res[0]) if res else 0
+    except Exception as e:
+        raise HTTPException(500, f"Error on-chain: {e}")
+
+    starknet_address_hex = None
+    alias_text = None
+    if alias_key:
+        try:
+            addr_res = await client.call_contract(
+                call=Call(
+                    to_addr=ALIAS_CONTRACT,
+                    selector=get_selector_from_name("addr_of_alias"),
+                    calldata=[alias_key],
+                ),
+                **block_kwargs,
+            )
+            addr_int = int(addr_res[0]) if addr_res else 0
+            if addr_int:
+                starknet_address_hex = hex(addr_int)
+                alias_res = await client.call_contract(
+                    call=Call(
+                        to_addr=ALIAS_CONTRACT,
+                        selector=get_selector_from_name("alias_of_addr"),
+                        calldata=[addr_int],
+                    ),
+                    **block_kwargs,
+                )
+                alias_felt = int(alias_res[0]) if alias_res else 0
+                alias_text = felt_to_ascii_str(alias_felt)
+                if alias_text and not ALIAS_REGEX.fullmatch(alias_text):
+                    alias_text = None
+        except Exception:
+            pass
+
+    chain_label = FELT_TO_CHAIN_LABEL.get(chain_id)
+    mem = None
+    if chain_label:
+        mem = EXTERNAL_INDEX.get(chain_label, {}).get(hex(ext_int))
+    if mem:
+        mem_copy = dict(mem)
+        if not alias_text:
+            alias_text = mem_copy.get("alias")
+        if not starknet_address_hex:
+            starknet_address_hex = mem_copy.get("address")
+    else:
+        mem_copy = None
+
+    return {
+        "chain_id_hex": hex(chain_id),
+        "chain_label": chain_label,
+        "external_address_felt": hex(ext_int),
+        "alias_key": hex(alias_key) if alias_key else None,
+        "alias": alias_text,
+        "starknet_address": starknet_address_hex,
+        "memory_index": mem_copy,
     }
 
 
 @app.get("/api/list")
 async def list_local():
-    items = [{"alias": alias, "alias_key": k, "address": addr} for k, (addr, alias) in ALIAS_INDEX.items()]
+    items = [dict(item) for item in ALIAS_INDEX.values()]
     items.sort(key=lambda x: x["alias"])
-    return {"count": len(items), "items": items}
+    external_counts = {label: len(values) for label, values in EXTERNAL_INDEX.items()}
+    return {"count": len(items), "items": items, "external_index_counts": external_counts}
 
 # ============================================================
 # FAUCET (envía AIC a la billetera conectada, solo para pruebas)
