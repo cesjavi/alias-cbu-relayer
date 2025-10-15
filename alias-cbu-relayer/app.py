@@ -608,7 +608,11 @@ async def resolve_address(address: str):
 
 
 @app.get("/api/contract_events")
-async def contract_events(limit: int = 20, continuation_token: Optional[str] = None):
+async def contract_events(
+    limit: int = 20,
+    continuation_token: Optional[str] = None,
+    max_chunks: int = 200,
+):
     if not ALIAS_CONTRACT:
         raise HTTPException(500, "ALIAS_CONTRACT no configurado")
 
@@ -625,15 +629,23 @@ async def contract_events(limit: int = 20, continuation_token: Optional[str] = N
         raise HTTPException(500, f"No se pudo calcular selector: {e}")
 
     chunk_size = max(1, min(int(limit or 20), 100))
+    max_scans = max(1, min(int(max_chunks or 1), 1000))
 
     next_token = continuation_token
-    prev_token = None
-    chunk = None
     raw_events = []
     fetches = 0
-    max_fetches = 5
+    empty_chunks = 0
+    visited_tokens = set()
+    truncated = False
 
-    while len(raw_events) < chunk_size and fetches < max_fetches:
+    while len(raw_events) < chunk_size:
+        marker = next_token or "__initial__"
+        if marker in visited_tokens:
+            truncated = True
+            next_token = None
+            break
+        visited_tokens.add(marker)
+
         try:
             chunk = await client.get_events(
                 address=ALIAS_CONTRACT,
@@ -647,14 +659,18 @@ async def contract_events(limit: int = 20, continuation_token: Optional[str] = N
             raise HTTPException(500, f"Error consultando eventos: {e}")
 
         fetches += 1
-        prev_token = next_token
-        next_token = chunk.continuation_token
-
         if chunk.events:
             raw_events.extend(chunk.events)
+        else:
+            empty_chunks += 1
 
-        if not next_token or next_token == prev_token:
-            next_token = None
+        next_token = chunk.continuation_token
+
+        if not next_token:
+            break
+
+        if fetches >= max_scans:
+            truncated = True
             break
 
     events = []
@@ -705,6 +721,9 @@ async def contract_events(limit: int = 20, continuation_token: Optional[str] = N
         "events": events,
         "chunk_size": chunk_size,
         "fetches": fetches,
+        "empty_chunks": empty_chunks,
+        "scanned_chunks": len(visited_tokens),
+        "truncated": truncated,
     }
 
 

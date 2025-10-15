@@ -512,6 +512,14 @@ $("btn-list-contract").onclick = async () => {
     if (tokenRaw && tokenRaw.trim()) {
       params.push(`continuation_token=${encodeURIComponent(tokenRaw.trim())}`);
     }
+    const maxChunksRaw = prompt("Máx. páginas a recorrer (1-1000, vacío = 200)", "");
+    if (maxChunksRaw && maxChunksRaw.trim()) {
+      const parsedChunks = Number.parseInt(maxChunksRaw, 10);
+      if (!Number.isNaN(parsedChunks)) {
+        const safeChunks = Math.max(1, Math.min(parsedChunks, 1000));
+        params.push(`max_chunks=${safeChunks}`);
+      }
+    }
     const qs = params.length ? `?${params.join("&")}` : "";
     const r = await getJSON(`/api/contract_events${qs}`);
     $("resolve-out").textContent = JSON.stringify(r, null, 2);

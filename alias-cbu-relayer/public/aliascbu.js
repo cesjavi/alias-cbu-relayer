@@ -301,6 +301,8 @@
     if (limit != null) params.set("limit", String(limit));
     if (opts.continuationToken) params.set("continuation_token", opts.continuationToken);
     if (opts.continuation_token) params.set("continuation_token", opts.continuation_token);
+    const maxChunks = opts.maxChunks ?? opts.max_chunks;
+    if (maxChunks != null) params.set("max_chunks", String(maxChunks));
     const qs = params.toString();
     return await httpJson(apiUrl(`/api/contract_events${qs ? `?${qs}` : ""}`));
   }
