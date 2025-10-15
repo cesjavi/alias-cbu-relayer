@@ -371,8 +371,20 @@ async def submit(data: SubmitIn):
     except ValueError:
         raise HTTPException(400, "user_address inválido (hex)")
 
-    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
-        raise HTTPException(400, "Nonce invalido (prepare faltante)")
+    addr_key = data.user_address.lower()
+    if data.nonce <= 0:
+        raise HTTPException(400, "Nonce inválido")
+
+    stored_nonce = NONCES.get(addr_key)
+    if stored_nonce is None:
+        # Entorno serverless puede inicializar un nuevo worker entre prepare y submit.
+        # Persistimos el nonce recibido para no exigir preparar de nuevo cuando
+        # el estado en memoria se perdió.
+        NONCES[addr_key] = data.nonce
+    elif data.nonce > stored_nonce + 1:
+        raise HTTPException(400, "Nonce fuera de rango; volvé a preparar la firma")
+    elif data.nonce == stored_nonce + 1:
+        NONCES[addr_key] = data.nonce
 
     if data.signature and len(data.signature) >= 2:
         r_hex, s_hex = data.signature[0], data.signature[1]
