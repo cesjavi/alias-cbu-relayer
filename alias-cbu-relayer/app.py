@@ -626,20 +626,39 @@ async def contract_events(limit: int = 20, continuation_token: Optional[str] = N
 
     chunk_size = max(1, min(int(limit or 20), 100))
 
-    try:
-        chunk = await client.get_events(
-            address=ALIAS_CONTRACT,
-            keys=[[event_key]],
-            from_block_number=0,
-            to_block_number="latest",
-            continuation_token=continuation_token,
-            chunk_size=chunk_size,
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Error consultando eventos: {e}")
+    next_token = continuation_token
+    prev_token = None
+    chunk = None
+    raw_events = []
+    fetches = 0
+    max_fetches = 5
+
+    while len(raw_events) < chunk_size and fetches < max_fetches:
+        try:
+            chunk = await client.get_events(
+                address=ALIAS_CONTRACT,
+                keys=[[event_key]],
+                from_block_number=0,
+                to_block_number="latest",
+                continuation_token=next_token,
+                chunk_size=chunk_size,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Error consultando eventos: {e}")
+
+        fetches += 1
+        prev_token = next_token
+        next_token = chunk.continuation_token
+
+        if chunk.events:
+            raw_events.extend(chunk.events)
+
+        if not next_token or next_token == prev_token:
+            next_token = None
+            break
 
     events = []
-    for evt in chunk.events:
+    for evt in raw_events[:chunk_size]:
         data = list(getattr(evt, "data", []) or [])
         alias_key_int = int(data[0]) if len(data) > 0 else 0
         eth_int = int(data[1]) if len(data) > 1 else 0
@@ -682,9 +701,10 @@ async def contract_events(limit: int = 20, continuation_token: Optional[str] = N
     return {
         "count": len(events),
         "event_key": hex(event_key),
-        "continuation_token": chunk.continuation_token,
+        "continuation_token": next_token,
         "events": events,
         "chunk_size": chunk_size,
+        "fetches": fetches,
     }
 
 
