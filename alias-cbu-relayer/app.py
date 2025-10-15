@@ -631,11 +631,11 @@ async def contract_events(
     chunk_size = max(1, min(int(limit or 20), 100))
     max_scans = max(1, min(int(max_chunks or 1), 1000))
 
-    def _event_matches(evt) -> bool:
+    def _event_matches(evt, *, allow_keyless: bool) -> bool:
         try:
             keys_iter = list(getattr(evt, "keys", []) or [])
         except Exception:
-            return False
+            keys_iter = []
 
         for key in keys_iter:
             try:
@@ -643,15 +643,23 @@ async def contract_events(
                     return True
             except Exception:
                 continue
+
+        if allow_keyless and not keys_iter:
+            data_values = list(getattr(evt, "data", []) or [])
+            # AliasExternalUpdated always contains exactly (alias_key, eth, btc)
+            if len(data_values) == 3:
+                return True
+
         return False
 
-    async def _scan_events(keys_filter):
+    async def _scan_events(keys_filter, *, allow_keyless: bool):
         next_token_local = continuation_token
         matched = []
         fetches_local = 0
         empty_local = 0
         visited_local = set()
         truncated_local = False
+        keyless_matches = 0
 
         while len(matched) < chunk_size:
             marker = next_token_local or "__initial__"
@@ -678,9 +686,17 @@ async def contract_events(
 
             matched_chunk = []
             for evt in chunk_events:
-                if _event_matches(evt):
+                matched_evt = _event_matches(evt, allow_keyless=allow_keyless)
+                if matched_evt:
                     matched.append(evt)
                     matched_chunk.append(evt)
+                    if allow_keyless:
+                        try:
+                            keys_iter = list(getattr(evt, "keys", []) or [])
+                        except Exception:
+                            keys_iter = []
+                        if not keys_iter:
+                            keyless_matches += 1
                     if len(matched) >= chunk_size:
                         break
 
@@ -703,13 +719,15 @@ async def contract_events(
             "empty": empty_local,
             "visited": visited_local,
             "truncated": truncated_local,
+            "keyless": keyless_matches,
         }
 
-    primary_scan = await _scan_events([[event_key]])
+    primary_scan = await _scan_events([[event_key]], allow_keyless=False)
     used_fallback = False
+    keyless_hits = primary_scan["keyless"]
 
     if not primary_scan["events"] and primary_scan["fetches"] > 0:
-        fallback_scan = await _scan_events(None)
+        fallback_scan = await _scan_events(None, allow_keyless=True)
         used_fallback = True
 
         chosen_events = fallback_scan["events"]
@@ -718,6 +736,7 @@ async def contract_events(
         empty_chunks = primary_scan["empty"] + fallback_scan["empty"]
         visited_tokens = primary_scan["visited"].union(fallback_scan["visited"])
         truncated = primary_scan["truncated"] or fallback_scan["truncated"]
+        keyless_hits += fallback_scan["keyless"]
     else:
         chosen_events = primary_scan["events"]
         next_token = primary_scan["next_token"]
@@ -778,6 +797,7 @@ async def contract_events(
         "scanned_chunks": len(visited_tokens),
         "truncated": truncated,
         "used_fallback_without_key": used_fallback,
+        "matched_keyless_events": keyless_hits,
     }
 
 
