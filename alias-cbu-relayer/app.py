@@ -604,6 +604,129 @@ async def resolve_address(address: str):
     }
 
 
+# ===== eventos on-chain =====
+
+
+@app.get("/api/contract_events")
+async def contract_events(
+    limit: int = 20,
+    continuation_token: Optional[str] = None,
+    max_chunks: int = 200,
+):
+    if not ALIAS_CONTRACT:
+        raise HTTPException(500, "ALIAS_CONTRACT no configurado")
+
+    client, _ = _get_client_and_relayer()
+
+    try:
+        from starknet_py.hash.selector import get_selector_from_name
+    except Exception as e:
+        raise HTTPException(500, f"starknet_py no disponible: {e}")
+
+    try:
+        event_key = get_selector_from_name("AliasExternalUpdated")
+    except Exception as e:
+        raise HTTPException(500, f"No se pudo calcular selector: {e}")
+
+    chunk_size = max(1, min(int(limit or 20), 100))
+    max_scans = max(1, min(int(max_chunks or 1), 1000))
+
+    next_token = continuation_token
+    raw_events = []
+    fetches = 0
+    empty_chunks = 0
+    visited_tokens = set()
+    truncated = False
+
+    while len(raw_events) < chunk_size:
+        marker = next_token or "__initial__"
+        if marker in visited_tokens:
+            truncated = True
+            next_token = None
+            break
+        visited_tokens.add(marker)
+
+        try:
+            chunk = await client.get_events(
+                address=ALIAS_CONTRACT,
+                keys=[[event_key]],
+                from_block_number=0,
+                to_block_number="latest",
+                continuation_token=next_token,
+                chunk_size=chunk_size,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Error consultando eventos: {e}")
+
+        fetches += 1
+        if chunk.events:
+            raw_events.extend(chunk.events)
+        else:
+            empty_chunks += 1
+
+        next_token = chunk.continuation_token
+
+        if not next_token:
+            break
+
+        if fetches >= max_scans:
+            truncated = True
+            break
+
+    events = []
+    for evt in raw_events[:chunk_size]:
+        data = list(getattr(evt, "data", []) or [])
+        alias_key_int = int(data[0]) if len(data) > 0 else 0
+        eth_int = int(data[1]) if len(data) > 1 else 0
+        btc_int = int(data[2]) if len(data) > 2 else 0
+
+        alias_key_hex = hex(alias_key_int) if alias_key_int else None
+        mem = ALIAS_INDEX.get(alias_key_hex) if alias_key_hex else None
+
+        events.append(
+            {
+                "block_number": getattr(evt, "block_number", None),
+                "block_hash": (
+                    hex(getattr(evt, "block_hash"))
+                    if getattr(evt, "block_hash", None) is not None
+                    else None
+                ),
+                "transaction_hash": (
+                    hex(getattr(evt, "transaction_hash"))
+                    if getattr(evt, "transaction_hash", None) is not None
+                    else None
+                ),
+                "from_address": (
+                    hex(getattr(evt, "from_address"))
+                    if getattr(evt, "from_address", None) is not None
+                    else None
+                ),
+                "alias_key": alias_key_hex,
+                "external": {
+                    "ETH": format_external_value(eth_int),
+                    "BTC": format_external_value(btc_int),
+                },
+                "raw_event": {
+                    "keys": [hex(k) for k in getattr(evt, "keys", []) or []],
+                    "data": [hex(v) for v in data],
+                },
+                "memory_index": dict(mem) if mem else None,
+            }
+        )
+
+    return {
+        "count": len(events),
+        "event_key": hex(event_key),
+        "continuation_token": next_token,
+        "events": events,
+        "chunk_size": chunk_size,
+        "fetches": fetches,
+        "empty_chunks": empty_chunks,
+        "scanned_chunks": len(visited_tokens),
+        "truncated": truncated,
+    }
+
+
 @app.get("/api/alias_of_external")
 async def alias_of_external(chain: str, external_address: str):
     chain_id = parse_chain_identifier(chain)
