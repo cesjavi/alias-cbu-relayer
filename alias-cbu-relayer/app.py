@@ -217,6 +217,55 @@ def meta_message(
         f"eth:{hex(eth_address)}|btc:{hex(btc_address)}"
     )
 
+
+def _flatten_exception_message(exc: Exception) -> str:
+    """Concatena mensajes de excepciones anidadas en una sola línea legible."""
+
+    parts = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+
+    while current and id(current) not in seen:
+        seen.add(id(current))
+
+        text = getattr(current, "message", None)
+        if not text:
+            args = getattr(current, "args", None)
+            if args:
+                text = " ".join(str(arg) for arg in args if arg)
+        if not text:
+            text = str(current)
+
+        if text:
+            parts.append(str(text))
+
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    if not parts:
+        return "Error desconocido"
+
+    collapsed = " | ".join(parts)
+    collapsed = re.sub(r"\s+", " ", collapsed).strip()
+    return collapsed[:800] + ("…" if len(collapsed) > 800 else "")
+
+
+def _classify_relayer_error(exc: Exception) -> tuple[int, str]:
+    raw = _flatten_exception_message(exc)
+    upper = raw.upper()
+
+    if "ALIAS_TAKEN" in upper:
+        return 409, "Alias ya registrado on-chain (ALIAS_TAKEN)."
+    if "ETH_ADDR_IN_USE" in upper:
+        return 409, "La dirección ETH ya está asociada a otro alias (ETH_ADDR_IN_USE)."
+    if "BTC_ADDR_IN_USE" in upper:
+        return 409, "La dirección externa ya está asociada a otro alias (BTC_ADDR_IN_USE)."
+    if "INSUFFICIENT" in upper and "BALANCE" in upper:
+        return 400, "Fondos insuficientes o approve faltante para el token AIC."
+    if "TRANSFER_FROM" in upper and "FAILED" in upper:
+        return 400, "transfer_from del token AIC falló (approve/balance)."
+
+    return 500, f"Error enviando transacción: {raw}"
+
 # ==== modelos ====
 class PrepareIn(BaseModel):
     alias: str
@@ -322,8 +371,20 @@ async def submit(data: SubmitIn):
     except ValueError:
         raise HTTPException(400, "user_address inválido (hex)")
 
-    if NONCES.get(data.user_address.lower(), 0) < data.nonce:
-        raise HTTPException(400, "Nonce invalido (prepare faltante)")
+    addr_key = data.user_address.lower()
+    if data.nonce <= 0:
+        raise HTTPException(400, "Nonce inválido")
+
+    stored_nonce = NONCES.get(addr_key)
+    if stored_nonce is None:
+        # Entorno serverless puede inicializar un nuevo worker entre prepare y submit.
+        # Persistimos el nonce recibido para no exigir preparar de nuevo cuando
+        # el estado en memoria se perdió.
+        NONCES[addr_key] = data.nonce
+    elif data.nonce > stored_nonce + 1:
+        raise HTTPException(400, "Nonce fuera de rango; volvé a preparar la firma")
+    elif data.nonce == stored_nonce + 1:
+        NONCES[addr_key] = data.nonce
 
     if data.signature and len(data.signature) >= 2:
         r_hex, s_hex = data.signature[0], data.signature[1]
@@ -343,7 +404,11 @@ async def submit(data: SubmitIn):
 
     client, relayer = _get_client_and_relayer()
     try:
-        from starknet_py.net.client_models import Call
+        from starknet_py.net.client_models import (
+            Call,
+            ResourceBounds,
+            ResourceBoundsMapping,
+        )
         from starknet_py.hash.selector import get_selector_from_name
         try:
             from starknet_py.net.client_models import BlockId, Tag
@@ -353,62 +418,121 @@ async def submit(data: SubmitIn):
     except Exception as e:
         raise HTTPException(500, f"starknet_py no disponible: {e}")
 
-    erc20_transfer_from = Call(
-        to_addr=AIC_TOKEN,
-        selector=get_selector_from_name("transfer_from"),
-        calldata=[user, relayer.address, FEE_AIC_WEI, 0],
-    )
-    alias_register = Call(
-        to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user, eth_int, btc_int],
-    )
-
     SAFE_FEE = int(5e17)
-    try:
-        if hasattr(relayer, "_estimate_fee"):
-            est = await relayer._estimate_fee(
-                calls=[erc20_transfer_from, alias_register],
-                block_id=block_id_pending,
-                version=3,
-                nonce=None,
-            )
-            fee_value = int(est.overall_fee * 13 // 10)
-        else:
-            raise Exception("_estimate_fee no disponible")
-    except Exception as e:
-        print("[warn] estimate failed, usando fee fijo:", e)
+
+    async def _estimate_fee_components(calls: list[Call]):
+        estimated_bounds: Optional[ResourceBoundsMapping] = None
         fee_value = SAFE_FEE
 
-    calls = [erc20_transfer_from, alias_register]
-    try:
+        try:
+            if hasattr(relayer, "_estimate_fee"):
+                est = await relayer._estimate_fee(
+                    calls=calls,
+                    block_id=block_id_pending,
+                    version=3,
+                    nonce=None,
+                )
+                fee_value = int(est.overall_fee * 13 // 10)
+                try:
+                    estimated_bounds = est.to_resource_bounds(
+                        amount_multiplier=1.3,
+                        unit_price_multiplier=1.3,
+                    )
+                except Exception as conv_err:
+                    print("[warn] no se pudo convertir fee estimate a resource_bounds:", conv_err)
+                    estimated_bounds = None
+            else:
+                raise Exception("_estimate_fee no disponible")
+        except Exception as e:
+            print("[warn] estimate failed, usando fee fijo:", e)
+
+        if fee_value <= 0:
+            fee_value = SAFE_FEE
+
+        return fee_value, estimated_bounds
+
+    async def _execute_with_calls(calls: list[Call], fee_value: int, estimated_bounds: Optional[ResourceBoundsMapping]):
         import inspect
 
         sig = inspect.signature(relayer.execute_v3)
-        kwargs = {"calls": calls}
+        params = sig.parameters
 
-        if "auto_estimate" in sig.parameters:
-            kwargs["auto_estimate"] = True
-        elif "estimate_fee_mode" in sig.parameters:
-            kwargs["estimate_fee_mode"] = "auto"
+        attempts = []
+
+        primary_kwargs = {"calls": calls}
+        if "auto_estimate" in params:
+            primary_kwargs["auto_estimate"] = True
+        elif "estimate_fee_mode" in params:
+            primary_kwargs["estimate_fee_mode"] = "auto"
+        attempts.append(primary_kwargs)
+
+        fallback_kwargs = {"calls": calls}
+        manual_fee_fields = False
+
+        if "resource_bounds" in params and estimated_bounds is not None:
+            fallback_kwargs["resource_bounds"] = estimated_bounds
+            manual_fee_fields = True
+
+        if "max_fee" in params:
+            fallback_kwargs["max_fee"] = fee_value
+            manual_fee_fields = True
+        elif "fee" in params:
+            fallback_kwargs["fee"] = fee_value
+            manual_fee_fields = True
+
+        if manual_fee_fields:
+            if "auto_estimate" in params:
+                fallback_kwargs["auto_estimate"] = False
+            attempts.append(fallback_kwargs)
+
+        last_error: Optional[Exception] = None
+        for kwargs in attempts:
+            try:
+                resp = await relayer.execute_v3(**kwargs)
+                return resp, None
+            except Exception as err:
+                last_error = err
+
+        return None, last_error
+
+    attempt_variants = []
+    # Variante original (contratos que aún esperan la longitud explícita)
+    attempt_variants.append(("with_len", [k, ln, user, eth_int, btc_int]))
+    # Variante sin longitud (contratos actualizados que la derivan internamente)
+    attempt_variants.append(("without_len", [k, user, eth_int, btc_int]))
+
+    resp = None
+    last_error: Optional[Exception] = None
+
+    for variant_name, alias_calldata in attempt_variants:
+        erc20_transfer_from = Call(
+            to_addr=AIC_TOKEN,
+            selector=get_selector_from_name("transfer_from"),
+            calldata=[user, relayer.address, FEE_AIC_WEI, 0],
+        )
+        alias_register = Call(
+            to_addr=ALIAS_CONTRACT,
+            selector=get_selector_from_name("admin_register_for"),
+            calldata=alias_calldata,
+        )
+
+        calls = [erc20_transfer_from, alias_register]
+        fee_value, estimated_bounds = await _estimate_fee_components(calls)
+
+        resp, last_error = await _execute_with_calls(calls, fee_value, estimated_bounds)
+        if resp is not None:
+            break
+
+        message = _flatten_exception_message(last_error) if last_error else ""
+        if variant_name == "with_len" and "INPUT TOO LONG FOR ARGUMENTS" in message.upper():
+            print("[info] admin_register_for sin parámetro len, reintentando compatibilidad")
+            continue
         else:
-            kwargs["auto_estimate"] = False
-            kwargs["max_fee"] = fee_value
+            break
 
-        resp = await relayer.execute_v3(**kwargs)
-    except Exception:
-        try:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                max_fee=fee_value,
-            )
-        except TypeError:
-            resp = await relayer.execute_v3(
-                calls=calls,
-                auto_estimate=False,
-                fee=fee_value,
-            )
+    if resp is None:
+        status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
+        raise HTTPException(status_code, message)
 
     tx_hash = getattr(resp, "transaction_hash", resp)
 
