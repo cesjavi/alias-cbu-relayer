@@ -418,103 +418,117 @@ async def submit(data: SubmitIn):
     except Exception as e:
         raise HTTPException(500, f"starknet_py no disponible: {e}")
 
-    erc20_transfer_from = Call(
-        to_addr=AIC_TOKEN,
-        selector=get_selector_from_name("transfer_from"),
-        calldata=[user, relayer.address, FEE_AIC_WEI, 0],
-    )
-    alias_register = Call(
-        to_addr=ALIAS_CONTRACT,
-        selector=get_selector_from_name("admin_register_for"),
-        calldata=[k, ln, user, eth_int, btc_int],
-    )
-
     SAFE_FEE = int(5e17)
-    estimated_bounds: Optional[ResourceBoundsMapping] = None
-    try:
-        if hasattr(relayer, "_estimate_fee"):
-            est = await relayer._estimate_fee(
-                calls=[erc20_transfer_from, alias_register],
-                block_id=block_id_pending,
-                version=3,
-                nonce=None,
-            )
-            fee_value = int(est.overall_fee * 13 // 10)
-            try:
-                estimated_bounds = est.to_resource_bounds(
-                    amount_multiplier=1.3,
-                    unit_price_multiplier=1.3,
+
+    async def _estimate_fee_components(calls: list[Call]):
+        estimated_bounds: Optional[ResourceBoundsMapping] = None
+        fee_value = SAFE_FEE
+
+        try:
+            if hasattr(relayer, "_estimate_fee"):
+                est = await relayer._estimate_fee(
+                    calls=calls,
+                    block_id=block_id_pending,
+                    version=3,
+                    nonce=None,
                 )
-            except Exception as conv_err:
-                print("[warn] no se pudo convertir fee estimate a resource_bounds:", conv_err)
-                estimated_bounds = None
-        else:
-            raise Exception("_estimate_fee no disponible")
-    except Exception as e:
-        print("[warn] estimate failed, usando fee fijo:", e)
-        fee_value = SAFE_FEE
+                fee_value = int(est.overall_fee * 13 // 10)
+                try:
+                    estimated_bounds = est.to_resource_bounds(
+                        amount_multiplier=1.3,
+                        unit_price_multiplier=1.3,
+                    )
+                except Exception as conv_err:
+                    print("[warn] no se pudo convertir fee estimate a resource_bounds:", conv_err)
+                    estimated_bounds = None
+            else:
+                raise Exception("_estimate_fee no disponible")
+        except Exception as e:
+            print("[warn] estimate failed, usando fee fijo:", e)
 
-    if fee_value <= 0:
-        fee_value = SAFE_FEE
+        if fee_value <= 0:
+            fee_value = SAFE_FEE
 
-    calls = [erc20_transfer_from, alias_register]
+        return fee_value, estimated_bounds
+
+    async def _execute_with_calls(calls: list[Call], fee_value: int, estimated_bounds: Optional[ResourceBoundsMapping]):
+        import inspect
+
+        sig = inspect.signature(relayer.execute_v3)
+        params = sig.parameters
+
+        attempts = []
+
+        primary_kwargs = {"calls": calls}
+        if "auto_estimate" in params:
+            primary_kwargs["auto_estimate"] = True
+        elif "estimate_fee_mode" in params:
+            primary_kwargs["estimate_fee_mode"] = "auto"
+        attempts.append(primary_kwargs)
+
+        fallback_kwargs = {"calls": calls}
+        manual_fee_fields = False
+
+        if "resource_bounds" in params and estimated_bounds is not None:
+            fallback_kwargs["resource_bounds"] = estimated_bounds
+            manual_fee_fields = True
+
+        if "max_fee" in params:
+            fallback_kwargs["max_fee"] = fee_value
+            manual_fee_fields = True
+        elif "fee" in params:
+            fallback_kwargs["fee"] = fee_value
+            manual_fee_fields = True
+
+        if manual_fee_fields:
+            if "auto_estimate" in params:
+                fallback_kwargs["auto_estimate"] = False
+            attempts.append(fallback_kwargs)
+
+        last_error: Optional[Exception] = None
+        for kwargs in attempts:
+            try:
+                resp = await relayer.execute_v3(**kwargs)
+                return resp, None
+            except Exception as err:
+                last_error = err
+
+        return None, last_error
+
+    attempt_variants = []
+    # Variante original (contratos que aún esperan la longitud explícita)
+    attempt_variants.append(("with_len", [k, ln, user, eth_int, btc_int]))
+    # Variante sin longitud (contratos actualizados que la derivan internamente)
+    attempt_variants.append(("without_len", [k, user, eth_int, btc_int]))
 
     resp = None
     last_error: Optional[Exception] = None
 
-    import inspect
-
-    sig = inspect.signature(relayer.execute_v3)
-    params = sig.parameters
-
-    attempts = []
-
-    primary_kwargs = {"calls": calls}
-    if "auto_estimate" in params:
-        primary_kwargs["auto_estimate"] = True
-    elif "estimate_fee_mode" in params:
-        primary_kwargs["estimate_fee_mode"] = "auto"
-    attempts.append(primary_kwargs)
-
-    fallback_kwargs = {"calls": calls}
-    manual_fee_fields = False
-
-    if "resource_bounds" in params and estimated_bounds is not None:
-        fallback_kwargs["resource_bounds"] = ResourceBoundsMapping(
-            l1_gas=ResourceBounds(
-                max_amount=estimated_bounds.l1_gas.max_amount,
-                max_price_per_unit=estimated_bounds.l1_gas.max_price_per_unit,
-            ),
-            l1_data_gas=ResourceBounds(
-                max_amount=estimated_bounds.l1_data_gas.max_amount,
-                max_price_per_unit=estimated_bounds.l1_data_gas.max_price_per_unit,
-            ),
-            l2_gas=ResourceBounds(
-                max_amount=estimated_bounds.l2_gas.max_amount,
-                max_price_per_unit=estimated_bounds.l2_gas.max_price_per_unit,
-            ),
+    for variant_name, alias_calldata in attempt_variants:
+        erc20_transfer_from = Call(
+            to_addr=AIC_TOKEN,
+            selector=get_selector_from_name("transfer_from"),
+            calldata=[user, relayer.address, FEE_AIC_WEI, 0],
         )
-        manual_fee_fields = True
+        alias_register = Call(
+            to_addr=ALIAS_CONTRACT,
+            selector=get_selector_from_name("admin_register_for"),
+            calldata=alias_calldata,
+        )
 
-    if "max_fee" in params:
-        fallback_kwargs["max_fee"] = fee_value
-        manual_fee_fields = True
-    elif "fee" in params:
-        fallback_kwargs["fee"] = fee_value
-        manual_fee_fields = True
+        calls = [erc20_transfer_from, alias_register]
+        fee_value, estimated_bounds = await _estimate_fee_components(calls)
 
-    if manual_fee_fields:
-        if "auto_estimate" in params:
-            fallback_kwargs["auto_estimate"] = False
-        attempts.append(fallback_kwargs)
-
-    for kwargs in attempts:
-        try:
-            resp = await relayer.execute_v3(**kwargs)
+        resp, last_error = await _execute_with_calls(calls, fee_value, estimated_bounds)
+        if resp is not None:
             break
-        except Exception as err:
-            last_error = err
-            resp = None
+
+        message = _flatten_exception_message(last_error) if last_error else ""
+        if variant_name == "with_len" and "INPUT TOO LONG FOR ARGUMENTS" in message.upper():
+            print("[info] admin_register_for sin parámetro len, reintentando compatibilidad")
+            continue
+        else:
+            break
 
     if resp is None:
         status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
