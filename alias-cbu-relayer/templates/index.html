@@ -7,7 +7,7 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 840px; margin: 2rem auto; padding: 0 1rem; background: #fafafa; }
     label { display:block; margin-top: 1rem; font-weight: 600; }
-    input, button { padding: .6rem .8rem; font-size: 1rem; }
+    input, button, select { padding: .6rem .8rem; font-size: 1rem; }
     button { cursor:pointer; border-radius: 6px; border: 1px solid #ccc; background: white; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .row { display:flex; gap:.5rem; align-items:center; flex-wrap: wrap; }
@@ -33,7 +33,14 @@
   </p>
 
   <div class="card">
+    <label for="wallet-select">Elegí la wallet</label>
     <div class="row">
+      <select id="wallet-select" style="min-width: 200px;">
+        <option value="auto">Detección automática</option>
+        <option value="argentx">ArgentX Ready</option>
+        <option value="braavos">Braavos</option>
+        <option value="xverse">Xverse</option>
+      </select>
       <button id="btn-connect">Conectar Wallet</button>
       <button id="btn-reset" type="button">Reset</button>
       <span id="acc" class="mono"></span>
@@ -113,6 +120,7 @@
     const ethInputEl = $("eth-address");
     const btcInputEl = $("btc-address");
     const chainSelect = $("chain-select");
+    const walletSelect = $("wallet-select");
     const externalAddressInput = $("external-address");
 
     function shortHex(h){ if(!h) return ""; const s=h.replace(/^0x/,""); return "0x"+s.slice(0,6)+"…"+s.slice(-6); }
@@ -232,15 +240,33 @@
       });
     }
 
-    async function connectDirect() {
+    const FRIENDLY_WALLET_NAME = {
+      auto: "detección automática",
+      argentx: "ArgentX Ready",
+      braavos: "Braavos",
+      xverse: "Xverse",
+    };
+
+    async function connectDirect(preference = "auto") {
       const { braavos, argentx, xverse } = await waitForWallets(8000);
+      const normalized = (preference || "auto").toLowerCase();
+      const braavosLegacy = window.braavos;
       const candidates = [
-        { name: 'ArgentX', obj: argentx },
-        { name: 'Braavos', obj: braavos },
-        { name: 'Xverse', obj: xverse },
-        { name: 'Braavos (legacy)', obj: window.braavos }
+        { name: 'ArgentX', id: 'argentx', obj: argentx },
+        { name: 'Braavos', id: 'braavos', obj: braavos },
+        { name: 'Xverse', id: 'xverse', obj: xverse },
+        { name: 'Braavos (legacy)', id: 'braavos', obj: braavosLegacy }
       ];
-      for (const { name, obj } of candidates) {
+      const preferredCandidates = normalized === 'auto'
+        ? candidates
+        : candidates.filter(c => c.id === normalized);
+      if (normalized !== 'auto' && preferredCandidates.length === 0) {
+        const label = FRIENDLY_WALLET_NAME[normalized] || preference;
+        throw new Error(`No se detectó ${label}. Revisá la extensión y recargá.`);
+      }
+      const pool = normalized === 'auto' ? candidates : preferredCandidates;
+      let lastError = null;
+      for (const { name, obj } of pool) {
         if (!obj) continue;
         try {
           if (typeof obj.enable === 'function') await obj.enable({ starknetVersion: 'v5' });
@@ -249,8 +275,19 @@
           if (acc?.address) return { account: acc, address: acc.address, name };
           if (obj.selectedAddress) return { account: obj, address: obj.selectedAddress, name };
         } catch (e) {
+          lastError = e;
           console.warn(`${name} falló:`, e?.message || e);
         }
+      }
+      if (normalized !== 'auto') {
+        const label = FRIENDLY_WALLET_NAME[normalized] || preference;
+        if (lastError) {
+          throw new Error(`No se pudo conectar con ${label}: ${lastError.message || lastError}.`);
+        }
+        throw new Error(`No se detectó ${label}. Revisá la extensión y recargá.`);
+      }
+      if (lastError) {
+        throw new Error(`No se pudo conectar con ninguna wallet disponible (${lastError.message || lastError}).`);
       }
       throw new Error("No se encontró ArgentX, Braavos ni Xverse. Revisá 'Site access' en la extensión y recargá.");
     }
@@ -275,8 +312,10 @@
 
     $("btn-connect").onclick = async () => {
       try {
-        log("Conectando wallet...");
-        const conn = await connectDirect();
+        const pref = walletSelect ? walletSelect.value : "auto";
+        const label = FRIENDLY_WALLET_NAME[pref] || pref;
+        log(`Conectando wallet (${label})...`);
+        const conn = await connectDirect(pref);
         account = conn.account;
         userAddr = padHex64(conn.address);
         walletName = conn.name;
@@ -333,6 +372,9 @@
       ethInputEl && (ethInputEl.value = "");
       btcInputEl && (btcInputEl.value = "");
       externalAddressInput && (externalAddressInput.value = "");
+      if (walletSelect) {
+        walletSelect.value = "auto";
+      }
       if (chainSelect && chainSelect.options.length) {
         chainSelect.selectedIndex = 0;
       }
