@@ -56,6 +56,21 @@ CHAIN_LABEL_TO_FELT = {
 }
 FELT_TO_CHAIN_LABEL = {value: key for key, value in CHAIN_LABEL_TO_FELT.items()}
 
+# ==== Codificación helpers ====
+def encode_external_updates_span(eth_value: int, btc_value: int) -> list[int]:
+    """Construye un Span(chain_id, address) para admin_register_for versiones nuevas."""
+
+    updates: list[tuple[int, int]] = [
+        (CHAIN_ID_ETHEREUM_FELT, eth_value),
+        (CHAIN_ID_BITCOIN_FELT, btc_value),
+    ]
+
+    encoded: list[int] = [len(updates)]
+    for chain_id, address in updates:
+        encoded.extend([chain_id, address])
+
+    return encoded
+
 # ==== App FastAPI ====
 app = FastAPI(title="AliasCBU Relayer (Gasless AIC)")
 templates = Jinja2Templates(directory="templates")
@@ -496,6 +511,8 @@ async def submit(data: SubmitIn):
         return None, last_error
 
     attempt_variants = []
+    # Contratos nuevos que reciben un Span de actualizaciones externas
+    attempt_variants.append(("span_updates", [k, user, *encode_external_updates_span(eth_int, btc_int)]))
     # Variante original (contratos que aún esperan la longitud explícita)
     attempt_variants.append(("with_len", [k, ln, user, eth_int, btc_int]))
     # Variante sin longitud (contratos actualizados que la derivan internamente)
@@ -527,8 +544,14 @@ async def submit(data: SubmitIn):
         if variant_name == "with_len" and "INPUT TOO LONG FOR ARGUMENTS" in message.upper():
             print("[info] admin_register_for sin parámetro len, reintentando compatibilidad")
             continue
-        else:
-            break
+
+        if variant_name == "span_updates":
+            upper_msg = message.upper()
+            if "FAILED TO DESERIALIZE PARAM #2" in upper_msg or "INPUT TOO LONG FOR ARGUMENTS" in upper_msg:
+                print("[info] admin_register_for sin span externo, probando variantes legacy")
+                continue
+
+        break
 
     if resp is None:
         status_code, message = _classify_relayer_error(last_error or Exception("Error desconocido"))
