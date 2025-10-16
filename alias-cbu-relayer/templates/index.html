@@ -5,103 +5,367 @@
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Alias CBU – Gasless AIC</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 840px; margin: 2rem auto; padding: 0 1rem; background: #fafafa; }
-    label { display:block; margin-top: 1rem; font-weight: 600; }
-    input, button, select { padding: .6rem .8rem; font-size: 1rem; }
-    button { cursor:pointer; border-radius: 6px; border: 1px solid #ccc; background: white; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .row { display:flex; gap:.5rem; align-items:center; flex-wrap: wrap; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
-    .card { border:1px solid #ddd; border-radius: 10px; padding: 1rem; margin-top:1rem; background: white; }
-    .ok { color:#0a0; font-weight: 600; } 
-    .err { color:#a00; font-weight: 600; } 
-    .warn { color:#f80; font-weight: 600; }
-    .muted { color:#666; font-size:.9rem }
-    .alert { background: #fff3cd; border: 1px solid #ffc107; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
-    .alert-danger { background: #f8d7da; border-color: #f5c6cb; }
-    pre { background: #f5f5f5; padding: 0.5rem; border-radius: 4px; overflow-x: auto; }
-    #wallet-ok { margin-top: .5rem; color: #086; font-weight: 600; }
-    #wallet-error { margin-top: .5rem; color: #c00; }
+    :root {
+      --bg-start: #eef2ff;
+      --bg-end: #f7f7fb;
+      --card-bg: #ffffff;
+      --card-border: #d8def0;
+      --primary: #3c6df0;
+      --primary-hover: #345cd2;
+      --accent: #00b894;
+      --danger: #d7263d;
+      --text-muted: #5e6472;
+      --radius: 16px;
+      --shadow: 0 20px 40px -25px rgba(42, 63, 119, 0.55);
+      --transition: all 0.2s ease-in-out;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: "Inter", "SF Pro Text", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      margin: 0;
+      padding: 2.5rem 1.5rem 3rem;
+      background: linear-gradient(160deg, var(--bg-start), var(--bg-end));
+      color: #1f2430;
+      display: flex;
+      justify-content: center;
+    }
+
+    main {
+      width: 100%;
+      max-width: 880px;
+    }
+
+    h1 {
+      font-size: clamp(1.9rem, 3vw, 2.6rem);
+      margin-bottom: 0.35rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    h3 {
+      font-size: 1.35rem;
+      margin-top: 0;
+      margin-bottom: 0.75rem;
+      letter-spacing: -0.005em;
+    }
+
+    label {
+      display: block;
+      margin-top: 1.1rem;
+      margin-bottom: 0.25rem;
+      font-weight: 600;
+      color: #2f3545;
+    }
+
+    input,
+    button,
+    select {
+      font-size: 1rem;
+      padding: 0.7rem 0.85rem;
+      border-radius: 10px;
+      border: 1px solid #ccd5f0;
+      background: #fdfdff;
+      transition: var(--transition);
+    }
+
+    input:focus,
+    select:focus,
+    button:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(60, 109, 240, 0.15);
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      font-weight: 600;
+      background: var(--primary);
+      color: #fff;
+      box-shadow: 0 14px 24px -18px rgba(60, 109, 240, 0.8);
+      transition: var(--transition);
+    }
+
+    button.secondary {
+      background: #f0f3ff;
+      color: #1f2430;
+      box-shadow: none;
+    }
+
+    button.secondary:hover:not(:disabled) {
+      background: #e6ecff;
+    }
+
+    button.danger {
+      background: var(--danger);
+      box-shadow: 0 14px 28px -20px rgba(215, 38, 61, 0.9);
+    }
+
+    button.success {
+      background: var(--accent);
+      box-shadow: 0 14px 28px -20px rgba(0, 184, 148, 0.9);
+    }
+
+    button:hover:not(:disabled) {
+      background: var(--primary-hover);
+      transform: translateY(-1px);
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .row {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .row.tight {
+      gap: 0.5rem;
+    }
+
+    .mono {
+      font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+      font-size: 0.9em;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 1.4rem 1.6rem;
+      margin-top: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+
+    .card.is-muted {
+      background: #f7f9ff;
+      border-color: rgba(60, 109, 240, 0.15);
+      box-shadow: none;
+    }
+
+    .muted {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 0.7rem;
+      margin-top: 1rem;
+    }
+
+    .steps button {
+      width: 100%;
+      justify-content: center;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .steps button span {
+      display: inline-flex;
+      width: 2rem;
+      height: 2rem;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.2);
+      font-size: 0.85rem;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+    }
+
+    pre {
+      background: #0b1021;
+      color: #d6e3ff;
+      padding: 0.85rem 1rem;
+      border-radius: 12px;
+      overflow-x: auto;
+      border: 1px solid #1d294a;
+    }
+
+    #wallet-ok {
+      margin-top: 0.5rem;
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    #wallet-error {
+      margin-top: 0.5rem;
+      color: var(--danger);
+      font-weight: 600;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(60, 109, 240, 0.12);
+      color: #2b3c88;
+      padding: 0.3rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      margin-top: 0.75rem;
+    }
+
+    .badge-ok { background: rgba(0, 184, 148, 0.15); color: #006e58; }
+    .badge-err { background: rgba(215, 38, 61, 0.12); color: #8d1122; }
+    .badge-warn { background: rgba(255, 179, 0, 0.18); color: #8d5b00; }
+
+    .alias-card {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .alias-card .row {
+      align-items: stretch;
+    }
+
+    .alias-card select {
+      min-width: 210px;
+    }
+
+    .helper-text {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 0.35rem;
+    }
+
+    .divider {
+      height: 1px;
+      background: #e4e7f5;
+      margin: 1.5rem 0 1rem;
+    }
+
+    .card-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .card-actions small {
+      color: var(--text-muted);
+    }
+
+    @media (max-width: 720px) {
+      body { padding: 2rem 1.25rem; }
+      .card { padding: 1.25rem 1.2rem; }
+      .row { gap: 0.6rem; }
+      input,
+      button,
+      select { font-size: 0.97rem; }
+    }
   </style>
 </head>
 <body>
-  <h1>Registrar alias (gasless, paga en AIC)</h1>
- 
-  <p class="muted">
-    1) Conectá wallet · 2) Prepará · 3) Approve AIC · 4) Firmar · 5) Enviar<br/>
-    <small>Si el approve falla, usá Firefox o actualizá la extensión.</small>
-  </p>
-
-  <div class="card">
-    <label for="wallet-select">Elegí la wallet</label>
-    <div class="row">
-      <select id="wallet-select" style="min-width: 200px;">
-        <option value="auto">Detección automática</option>
-        <option value="argentx">ArgentX Ready</option>
-        <option value="braavos">Braavos</option>
-        <option value="xverse">Xverse</option>
-      </select>
-      <button id="btn-connect">Conectar Wallet</button>
-      <button id="btn-reset" type="button">Reset</button>
-      <span id="acc" class="mono"></span>
-    </div>
-
-    <label for="alias">Alias (a-z 0-9 .) 4–20</label>
-    <input id="alias" placeholder="mi.alias" style="width:100%; font-family: monospace;"/>
-
-    <div class="card" style="background:#f9fbff; margin-top:1rem;">
-      <strong>Direcciones externas (opcional)</strong>
-      <p class="muted" style="margin-top:.5rem;">
-        Se convierten a <code>felt</code>. Ingresá valores en hex <code>0x…</code> o texto ASCII (≤31 bytes).
+  <main>
+    <header class="card" style="margin-top:0;">
+      <h1>Registrar alias (gasless, paga en AIC)</h1>
+      <p class="muted">
+        Seguí los pasos para completar el registro con una experiencia guiada.
       </p>
-      <label for="eth-address" style="margin-top:.5rem;">ETH (0x…)</label>
-      <input id="eth-address" placeholder="0x1234…" style="width:100%; font-family: monospace;"/>
-      <label for="btc-address" style="margin-top:.5rem;">BTC / identificador</label>
-      <input id="btc-address" placeholder="btc1… / hash" style="width:100%; font-family: monospace;"/>
-    </div>
+      <div class="status-badge">
+        <span>✨</span> 1) Conectá wallet · 2) Prepará · 3) Approve · 4) Firmar · 5) Enviar
+      </div>
+      <div class="helper-text">Si el approve falla, probá con Firefox o actualizá la extensión.</div>
+    </header>
 
-    <div class="row" style="margin-top: .5rem;">
-      <button id="btn-prepare" disabled>1. Preparar</button>
-      <button id="btn-approve" disabled>2. Approve AIC</button>
-      <button id="btn-sign" disabled>3. Firmar</button>
-      <button id="btn-submit" disabled>4. Enviar</button>
-    </div>
+    <section class="card alias-card">
+      <div class="row">
+        <div style="flex:1; min-width:220px;">
+          <label for="wallet-select">Elegí la wallet</label>
+          <select id="wallet-select" style="width:100%;">
+            <option value="auto">Detección automática</option>
+            <option value="argentx">ArgentX Ready</option>
+            <option value="braavos">Braavos</option>
+            <option value="xverse">Xverse</option>
+          </select>
+          <div class="helper-text">Seleccioná el proveedor antes de conectar.</div>
+        </div>
+        <div class="row tight" style="flex:1; min-width:250px; align-self:flex-end;">
+          <button id="btn-connect" style="flex:1;">
+            <span>🔗</span>Conectar Wallet
+          </button>
+          <button id="btn-reset" type="button" class="secondary" style="flex:0 0 auto;">Reiniciar</button>
+        </div>
+      </div>
+      <span id="acc" class="mono" style="font-size:0.95rem; color:#2b3c88;"></span>
 
-    <div id="prep" class="mono" style="white-space:pre-wrap; margin-top:1rem; font-size: 0.85em;"></div>
-    <div id="out" style="margin-top:1rem;"></div>
-  </div>
+      <div class="divider"></div>
 
-  <div class="card">
-    <h3>Buscar / Resolver</h3>
-    <div class="row">
-      <input id="q-alias" placeholder="alias (p.ej. pepe.123)" style="flex:1; font-family:monospace;">
-      <button id="btn-resolve-alias">Alias → Address</button>
-    </div>
-    <div class="row" style="margin-top:.5rem;">
-      <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
-      <button id="btn-resolve-addr">Address → Alias</button>
-    </div>
-    <div class="row" style="margin-top:.5rem;">
-      <select id="chain-select" style="flex:0 0 160px;">
-        <option value="ETH">ETH</option>
-        <option value="BTC">BTC</option>
-      </select>
-      <input id="external-address" placeholder="externo (0x… o ASCII)" style="flex:1; font-family:monospace;">
-      <button id="btn-resolve-external">Ext → Alias</button>
-    </div>
-    <div class="row" style="margin-top:.5rem;">
-      <button id="btn-list">Listar (índice local del relayer)</button>
-      <button id="btn-list-contract">Listar on-chain (AliasExternalUpdated)</button>
-    </div>
-    <div class="row" style="margin-top:.5rem;">
-  <button id="btn-faucet" style="background:#0a0; color:#fff;">🚰 Faucet AIC</button>
-</div>
+      <div>
+        <label for="alias">Alias (a-z 0-9 .) 4–20</label>
+        <input id="alias" placeholder="mi.alias" style="width:100%; font-family: monospace;"/>
+      </div>
 
-    <pre id="resolve-out" class="mono" style="margin-top: .5rem;"></pre>
-  </div>
+      <div class="card is-muted">
+        <strong>Direcciones externas (opcional)</strong>
+        <p class="muted" style="margin-top:.5rem;">
+          Se convierten a <code>felt</code>. Ingresá valores en hex <code>0x…</code> o texto ASCII (≤31 bytes).
+        </p>
+        <label for="eth-address" style="margin-top:.5rem;">ETH (0x…)</label>
+        <input id="eth-address" placeholder="0x1234…" style="width:100%; font-family: monospace;"/>
+        <label for="btc-address" style="margin-top:.5rem;">BTC / identificador</label>
+        <input id="btc-address" placeholder="btc1… / hash" style="width:100%; font-family: monospace;"/>
+      </div>
 
-  <div id="wallet-ok"></div>
-  <div id="wallet-error"></div>
+      <div class="steps">
+        <button id="btn-prepare" disabled><span>1</span>Preparar</button>
+        <button id="btn-approve" disabled><span>2</span>Approve AIC</button>
+        <button id="btn-sign" disabled><span>3</span>Firmar</button>
+        <button id="btn-submit" disabled class="success"><span>4</span>Enviar</button>
+      </div>
+
+      <div id="prep" class="mono" style="white-space:pre-wrap; margin-top:1rem; font-size: 0.85em;"></div>
+      <div id="out" style="margin-top:1rem;"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-actions">
+        <h3>Buscar / Resolver</h3>
+        <small>Consultá el índice del relayer o la chain directamente.</small>
+      </div>
+      <div class="row">
+        <input id="q-alias" placeholder="alias (p.ej. pepe.123)" style="flex:1; font-family:monospace;">
+        <button id="btn-resolve-alias" class="secondary">Alias → Address</button>
+      </div>
+      <div class="row" style="margin-top:.5rem;">
+        <input id="q-addr" placeholder="0x..." style="flex:1; font-family:monospace;">
+        <button id="btn-resolve-addr" class="secondary">Address → Alias</button>
+      </div>
+      <div class="row" style="margin-top:.5rem;">
+        <select id="chain-select" style="flex:0 0 160px;">
+          <option value="ETH">ETH</option>
+          <option value="BTC">BTC</option>
+        </select>
+        <input id="external-address" placeholder="externo (0x… o ASCII)" style="flex:1; font-family:monospace;">
+        <button id="btn-resolve-external" class="secondary">Ext → Alias</button>
+      </div>
+      <div class="row" style="margin-top:.5rem;">
+        <button id="btn-list" class="secondary">Listar (índice local del relayer)</button>
+        <button id="btn-list-contract" class="secondary">Listar on-chain (AliasExternalUpdated)</button>
+      </div>
+      <div class="row" style="margin-top:.5rem;">
+        <button id="btn-faucet" class="success">🚰 Faucet AIC</button>
+      </div>
+
+      <pre id="resolve-out" class="mono" style="margin-top: .75rem;"></pre>
+    </section>
+
+    <div id="wallet-ok"></div>
+    <div id="wallet-error"></div>
+  </main>
 
   <!-- API_BASE vacío = MISMO dominio (Vercel sirve app.py en /api/*) -->
   <script>
